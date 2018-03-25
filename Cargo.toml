@@ -1,0 +1,9 @@
+[package]
+name = "raft-tokio"
+version = "0.1.0"
+authors = ["Albibek <albibek@gmail.com>"]
+
+[dependencies]
+raft-consensus= { version = "^0.1", features = ["serde"] }
+tokio="^0.1"
+futures-timer="^0.1"
