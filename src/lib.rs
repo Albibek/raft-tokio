@@ -1,3 +1,4 @@
+extern crate bytes;
 ///! # Connection handling.
 ///! In raft every node is equal to others. So main question here is, in TCP terms, which of nodes
 ///! should be a client and which of them should be a server. To solve this problem we make the
@@ -14,6 +15,7 @@
 extern crate futures_timer;
 extern crate raft_consensus;
 extern crate tokio;
+extern crate tokio_io;
 
 use std::io;
 use std::net::SocketAddr;
@@ -23,21 +25,29 @@ use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
 use tokio::prelude::future::*;
+use tokio_io::codec::{Decoder, Encoder};
+use bytes::BytesMut;
 
 use raft_consensus::{ClientId, Consensus, ConsensusHandler, ServerId, SharedConsensus};
 
-struct Connections(Arc<Mutex<HashMap<ServerId, Option<SocketAddr>>>>);
+mod codec;
+use codec::*;
+
+#[derive(Debug, Clone)]
+pub struct Connections(Arc<Mutex<HashMap<ServerId, SocketAddr>>>);
 
 /// RaftServer works all the time raft exists, is responsible for keeping all connections
 /// to all nodes alive and in a single unique instance
-struct RaftServer {
+pub struct RaftServer {
+    id: ServerId,
     listen: SocketAddr,
     peers: Connections,
 }
 
 impl RaftServer {
-    fn new(listen: SocketAddr, conns: Connections) -> Self {
+    pub fn new(id: ServerId, listen: SocketAddr, conns: Connections) -> Self {
         Self {
+            id,
             listen,
             peers: conns,
         }
@@ -47,19 +57,37 @@ impl RaftServer {
 impl IntoFuture for RaftServer {
     type Item = ();
     type Error = io::Error;
-    type Future = Box<Future<Item = Self::Item, Error = Self::Error>>;
+    type Future = Box<Future<Item = Self::Item, Error = Self::Error> + Send>;
 
     fn into_future(self) -> Self::Future {
-        let Self { listen, peers } = self;
+        let Self {
+            id: selfid,
+            listen,
+            peers,
+        } = self;
         let listener = TcpListener::bind(&listen);
         let listener = match listener {
             Ok(i) => i,
             Err(e) => return Box::new(failed(e)),
         };
-        let fut = listener.incoming().for_each(|stream| {
-            let remote = stream.peer_addr();
+        let fut = listener.incoming().for_each(move |stream| {
+            let remote = stream.peer_addr().unwrap();
             println!("{:?} connected", remote);
-            //
+            let framed = stream.framed(HandshakeCodec(selfid));
+            let fut = framed.into_future().and_then(|(maybe_id, stream)| {
+                let id = maybe_id.unwrap();
+                let mut peers = peers.0.lock().unwrap();
+                let mut new = false;
+                let mut remote = peers.entry(id).or_insert_with(|| {
+                    new = true;
+                    remote
+                });
+                if !new {
+                    println!("neet to do something with old {:?}", remote)
+                }
+
+                Ok(stream.into_inner())
+            });
             Ok(())
         });
         Box::new(fut)
@@ -70,9 +98,12 @@ impl IntoFuture for RaftServer {
 mod tests {
 
     use std::collections::HashMap;
+    use std::thread;
+
     use futures_timer::ext::{FutureExt, StreamExt};
     use tokio;
     use tokio::prelude::*;
+    use tokio::prelude::future::*;
     use tokio::net::TcpStream;
     use std::time::Duration;
     use std::net::SocketAddr;
@@ -80,6 +111,7 @@ mod tests {
     use raft_consensus::message::{ClientResponse, ConsensusTimeout, PeerMessage};
     use raft_consensus::persistent_log::mem::MemLog;
     use raft_consensus::state_machine::null::NullStateMachine;
+    use super::*;
 
     #[derive(Debug)]
     struct TokioHandler;
@@ -96,18 +128,34 @@ mod tests {
         nodes.insert(1.into(), "127.0.0.1:9991".parse().unwrap());
         nodes.insert(2.into(), "127.0.0.1:9992".parse().unwrap());
         for (id, addr) in nodes.clone().into_iter() {
-            let peers = nodes
-                .iter()
-                .filter(|&(iid, _)| *iid != id)
-                .map(|(iid, _)| *iid)
-                .collect();
-            let log = MemLog::new();
-            let sm = NullStateMachine;
-            let chandler = TokioHandler;
-            let consensus = Consensus::new(id, peers, log, sm, chandler).unwrap();
-            let consensus = SharedConsensus::new(consensus);
+            let nodes = nodes.clone();
+            thread::spawn(move || {
+                let (_, mut selfad) = nodes.clone().into_iter().next().unwrap();
+                let peers = nodes
+                    .iter()
+                    .filter(|&(iid, addr)| {
+                        if *iid != id {
+                            true
+                        } else {
+                            selfad = addr.clone();
+                            true
+                        }
+                    })
+                    .map(|(iid, _)| *iid)
+                    .collect();
+                let log = MemLog::new();
+                let sm = NullStateMachine;
+                let chandler = TokioHandler;
+                let consensus = Consensus::new(id, peers, log, sm, chandler).unwrap();
+                let consensus = SharedConsensus::new(consensus);
+                let conns = Connections(Arc::new(Mutex::new(HashMap::new())));
 
-            tokio::run(conn);
+                let server = RaftServer::new(id, selfad, conns.clone())
+                    .into_future()
+                    .map_err(move |e| println!("SERVER ERROR {:?}", e));
+
+                tokio::run(server);
+            });
         }
     }
 }

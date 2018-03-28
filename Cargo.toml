@@ -7,3 +7,5 @@ authors = ["Albibek <albibek@gmail.com>"]
 raft-consensus= { version = "^0.1", features = ["serde"] }
 tokio="^0.1"
 futures-timer="^0.1"
+tokio-io="^0.1"
+bytes="^0.4"
