@@ -1,27 +1,45 @@
-use std::io;
+use std::io::{self, Read};
 
 use tokio_io::codec::{Decoder, Encoder};
 use bytes::BytesMut;
 
 use raft_consensus::{ClientId, Entry, ServerId};
 use raft_consensus::message::*;
+use bytes::{Buf, BufMut, IntoBuf};
+use rmp_serde::decode::{from_read, from_slice};
+use rmp_serde::encode::write;
+
+#[derive(Serialize, Deserialize)]
+pub enum Handshake {
+    Hello(ServerId),
+    Ehlo(ServerId),
+}
+
+impl From<Handshake> for ServerId {
+    fn from(hs: Handshake) -> Self {
+        1.into()
+    }
+}
 
 pub struct HandshakeCodec(pub ServerId);
 
 impl Decoder for HandshakeCodec {
-    type Item = ServerId;
+    type Item = Handshake;
     type Error = io::Error;
-    fn decode(&mut self, _src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        let message = 1;
-        Ok(Some(message.into()))
-        //
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        let message: Handshake = from_read(src.take().into_buf().reader()).unwrap();
+        Ok(Some(message))
     }
 }
 
 impl Encoder for HandshakeCodec {
-    type Item = ServerId;
+    type Item = Handshake;
     type Error = io::Error;
     fn encode(&mut self, item: Self::Item, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        dst.put_u8(97);
+        dst.put_u8(97);
+        dst.put_u8(97);
+        dst.put_u8(97);
         Ok(())
     }
 }
