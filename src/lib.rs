@@ -20,6 +20,7 @@ extern crate serde_derive;
 extern crate tokio;
 extern crate tokio_executor;
 extern crate tokio_io;
+extern crate tokio_reactor;
 extern crate tokio_timer;
 
 use std::io;
@@ -76,19 +77,22 @@ impl IntoFuture for RaftClient {
         let fut = client.and_then(move |stream| {
             println!("client {:?} connected to {:?}", selfid, remote);
             let framed = stream.framed(HandshakeCodec(selfid));
-            let fut = framed.send(selfid).and_then(|stream| {
-                stream
-                    .into_future()
-                    .and_then(|(maybe_id, stream)| {
-                        let id = maybe_id.unwrap();
-                        println!("handshake received {:?}", id);
-                        Ok(())
-                    })
-                    .map_err(|(e, _)| {
-                        println!("handshake recv error");
-                        e
-                    })
-            });
+            let fut = framed
+                .send(Handshake::Hello(selfid))
+                .and_then(|stream| {
+                    stream
+                        .into_future()
+                        .and_then(|(maybe_id, stream)| {
+                            let id = maybe_id.unwrap();
+                            println!("handshake received {:?}", id);
+                            Ok(())
+                        })
+                        .map_err(|(e, _)| {
+                            println!("handshake recv error");
+                            e
+                        })
+                })
+                .map(|_| ());
 
             //let mut peers = peers.0.lock().unwrap();
             //let mut new = false;
@@ -103,7 +107,7 @@ impl IntoFuture for RaftClient {
 
             //Ok(stream.into_inner())
             //});
-            Ok(())
+            Box::new(fut)
         });
         Box::new(fut)
     }
@@ -177,23 +181,39 @@ mod tests {
 
                     let server = RaftServer::new(id, selfad, conns.clone()).into_future();
 
-                    let mut cte = current_thread::CurrentThread::new();
-                    cte.spawn(server.map_err(move |e| println!("SERVER ERROR {:?}", e)));
-                    let remotes = nodes
-                        .iter()
-                        .filter(|&(iid, addr)| if *iid != id { true } else { false })
-                        .map(|(_, addr)| *addr)
-                        .collect::<Vec<_>>();
-                    for addr in remotes {
-                        let client = RaftClient::new(id, addr, conns.clone());
-                        cte.spawn(
-                            client
-                                .into_future()
-                                .map_err(move |e| println!("CLIENT ERROR {:?}", e)),
-                        );
-                    }
-                    cte.run_timeout(Duration::from_secs(10))
-                        .unwrap_or_else(|_| {});
+                    let mut enter = tokio_executor::enter().expect("Enter");
+                    let reactor = tokio_reactor::Reactor::new().expect("reactor");
+
+                    let handle = reactor.handle();
+                    let timer = tokio_timer::timer::Timer::new(reactor);
+                    let thandle = timer.handle();
+
+                    let mut exec = current_thread::CurrentThread::new_with_park(timer);
+
+                    tokio_reactor::with_default(&handle, &mut enter, move |e| {
+                        tokio_timer::with_default(&thandle, e, move |e| {
+                            exec.spawn(server.map_err(move |e| println!("SERVER ERROR {:?}", e)));
+                            let remotes = nodes
+                                .iter()
+                                .filter(|&(iid, addr)| if *iid != id { true } else { false })
+                                .map(|(_, addr)| *addr)
+                                .collect::<Vec<_>>();
+                            for addr in remotes {
+                                let client = RaftClient::new(id, addr, conns.clone());
+                                exec.spawn(
+                                    client
+                                        .into_future()
+                                        .map_err(move |e| println!("CLIENT ERROR {:?}", e)),
+                                );
+                            }
+
+                            exec.enter(e)
+                                .run_timeout(Duration::from_secs(10))
+                                .unwrap_or_else(|e| println!("loop done with err {:?}", e))
+                        })
+                    });
+
+                    println!("DONE");
                 })
                 .unwrap();
             threads.push(th);

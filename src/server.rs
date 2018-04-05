@@ -58,10 +58,17 @@ impl IntoFuture for RaftServer {
             let peers = peers.clone();
             let fut = framed
                 .into_future()
-                .map_err(|(e, _)| e)
+                .map_err(|(e, _)| {
+                    println!("framed err: {:?}", e);
+                    e
+                })
                 .and_then(move |(maybe_id, stream)| {
                     println!("server got ID {:?}", maybe_id);
-                    let id = maybe_id.unwrap();
+                    let id = if let Handshake::Hello(id) = maybe_id.unwrap() {
+                        id
+                    } else {
+                        unimplemented!()
+                    };
 
                     let mut peers = peers.0.lock().unwrap();
 
@@ -76,14 +83,16 @@ impl IntoFuture for RaftServer {
                         }
                     }
 
-                    stream.send(Handshake::Hello()selfid).map(|stream| (stream, rx))
+                    stream
+                        .send(Handshake::Hello(selfid))
+                        .map(|stream| (stream, rx))
                 })
                 .and_then(|(stream, rx)| {
                     println!("{:?}", stream.into_inner());
                     println!("{:?}", rx);
                     Ok(())
                 });
-            fut
+            fut.then(|_| Ok(())) // this avoids server exit on connection errors
         });
         Box::new(fut)
     }

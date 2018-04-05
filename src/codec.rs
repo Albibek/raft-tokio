@@ -9,7 +9,7 @@ use bytes::{Buf, BufMut, IntoBuf};
 use rmp_serde::decode::{from_read, from_slice};
 use rmp_serde::encode::write;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum Handshake {
     Hello(ServerId),
     Ehlo(ServerId),
@@ -27,7 +27,15 @@ impl Decoder for HandshakeCodec {
     type Item = Handshake;
     type Error = io::Error;
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        let message: Handshake = from_read(src.take().into_buf().reader()).unwrap();
+        if src.len() == 0 {
+            return Ok(None);
+        }
+        let message: Handshake =
+            //from_read(src.take().into_buf().reader()).map_err(|e| -> io::Error {
+            from_slice(&src).map_err(|e| -> io::Error {
+                println!("decoder err {:?}", e);
+                io::ErrorKind::Other.into()
+            })?;
         Ok(Some(message))
     }
 }
@@ -36,10 +44,11 @@ impl Encoder for HandshakeCodec {
     type Item = Handshake;
     type Error = io::Error;
     fn encode(&mut self, item: Self::Item, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        dst.put_u8(97);
-        dst.put_u8(97);
-        dst.put_u8(97);
-        dst.put_u8(97);
+        write(&mut dst.writer(), &item).map_err(|e| -> io::Error {
+            println!("encoder err {:?}", e);
+            io::ErrorKind::Other.into()
+        })?;
+
         Ok(())
     }
 }

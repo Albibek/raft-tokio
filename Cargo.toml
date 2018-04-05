@@ -8,6 +8,7 @@ raft-consensus = { version = "^0.1", features = ["use_serde"] }
 tokio = "^0.1"
 tokio-timer = "^0.2"
 tokio-executor = "^0.1"
+tokio-reactor = "^0.1"
 rmp-serde = "^0.13"
 futures = "^0.1"
 tokio-io = "^0.1"
