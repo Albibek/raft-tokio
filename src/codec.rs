@@ -31,8 +31,8 @@ impl Decoder for HandshakeCodec {
             return Ok(None);
         }
         let message: Handshake =
-            //from_read(src.take().into_buf().reader()).map_err(|e| -> io::Error {
-            from_slice(&src).map_err(|e| -> io::Error {
+            from_read(src.take().into_buf().reader()).map_err(|e| -> io::Error {
+                //    from_slice(&src).map_err(|e| -> io::Error {
                 println!("decoder err {:?}", e);
                 io::ErrorKind::Other.into()
             })?;

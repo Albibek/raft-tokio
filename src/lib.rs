@@ -40,6 +40,7 @@ use raft_consensus::{ClientId, Consensus, ConsensusHandler, ServerId, SharedCons
 
 mod codec;
 mod server;
+mod raft;
 use codec::*;
 use server::*;
 
@@ -85,14 +86,14 @@ impl IntoFuture for RaftClient {
                         .and_then(|(maybe_id, stream)| {
                             let id = maybe_id.unwrap();
                             println!("handshake received {:?}", id);
-                            Ok(())
+                            Ok((id, stream.into_inner()))
                         })
                         .map_err(|(e, _)| {
                             println!("handshake recv error");
                             e
                         })
                 })
-                .map(|_| ());
+                .map(|(id, stream)| ());
 
             //let mut peers = peers.0.lock().unwrap();
             //let mut new = false;
