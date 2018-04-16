@@ -58,22 +58,17 @@ pub struct RaftCodec;
 impl Decoder for RaftCodec {
     type Item = PeerMessage;
     type Error = io::Error;
-    fn decode(&mut self, _src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        // This is mocked message. TODO: return the real one
-        let message = AppendEntriesRequest {
-            term: 5.into(),
-            prev_log_index: 3.into(),
-            prev_log_term: 2.into(),
-            leader_commit: 4.into(),
-            entries: vec![
-                Entry {
-                    term: 9.into(),
-                    data: "qwer".to_string().into_bytes(),
-                },
-            ],
-        };
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.len() == 0 {
+            return Ok(None);
+        }
+        let message: PeerMessage =
+            from_read(src.take().into_buf().reader()).map_err(|e| -> io::Error {
+                //    from_slice(&src).map_err(|e| -> io::Error {
+                println!("decoder err {:?}", e);
+                io::ErrorKind::Other.into()
+            })?;
         Ok(Some(message.into()))
-        //
     }
 }
 
@@ -81,6 +76,11 @@ impl Encoder for RaftCodec {
     type Item = PeerMessage;
     type Error = io::Error;
     fn encode(&mut self, item: Self::Item, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        write(&mut dst.writer(), &item).map_err(|e| -> io::Error {
+            println!("encoder err {:?}", e);
+            io::ErrorKind::Other.into()
+        })?;
+
         Ok(())
     }
 }

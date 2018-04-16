@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
 use tokio::prelude::future::*;
-use tokio_io::codec::{Decoder, Encoder};
+use tokio_io::codec::{Decoder, Encoder, Framed};
 use bytes::BytesMut;
 
-use futures::sync::oneshot;
+use futures::sync::{oneshot, mpsc::UnboundedSender};
 
 use raft_consensus::{ClientId, Consensus, ConsensusHandler, ServerId, SharedConsensus};
 
@@ -23,14 +23,21 @@ pub struct RaftServer {
     id: ServerId,
     listen: SocketAddr,
     peers: Connections,
+    tx: UnboundedSender<(ServerId, Framed<TcpStream, RaftCodec>)>,
 }
 
 impl RaftServer {
-    pub fn new(id: ServerId, listen: SocketAddr, conns: Connections) -> Self {
+    pub fn new(
+        id: ServerId,
+        listen: SocketAddr,
+        conns: Connections,
+        tx: UnboundedSender<(ServerId, Framed<TcpStream, RaftCodec>)>,
+    ) -> Self {
         Self {
             id,
             listen,
             peers: conns,
+            tx,
         }
     }
 }
@@ -45,6 +52,7 @@ impl IntoFuture for RaftServer {
             id: selfid,
             listen,
             peers,
+            tx,
         } = self;
         let listener = TcpListener::bind(&listen);
         let listener = match listener {
@@ -52,6 +60,7 @@ impl IntoFuture for RaftServer {
             Err(e) => return Box::new(failed(e)),
         };
         let fut = listener.incoming().for_each(move |stream| {
+            let tx = tx.clone(); // TODO clone only after handshake passed
             let remote = stream.peer_addr().unwrap();
             println!("{:?} connected", remote);
             let framed = stream.framed(HandshakeCodec(selfid));
@@ -85,12 +94,16 @@ impl IntoFuture for RaftServer {
 
                     stream
                         .send(Handshake::Hello(selfid))
-                        .map(|stream| (stream, rx))
+                        .map(move |stream| (stream, id, rx))
                 })
-                .and_then(|(stream, rx)| {
-                    println!("{:?}", stream.into_inner());
-                    println!("{:?}", rx);
-                    Ok(())
+                .and_then(move |(stream, id, _rx)| {
+                    // TODO deal with rx
+                    let stream = stream.into_inner().framed(RaftCodec);
+                    tx.send((id, stream))
+                        .map_err(|e| {
+                            println!("SEND ERROR: {:?}", e);
+                        })
+                        .then(|_| Ok(())) // TODO: process errors
                 });
             fut.then(|_| Ok(())) // this avoids server exit on connection errors
         });

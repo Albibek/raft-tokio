@@ -127,12 +127,14 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio::net::TcpStream;
     use std::net::SocketAddr;
+    use futures::sync::mpsc::unbounded;
     use raft_consensus::{ClientId, Consensus, ConsensusHandler, ServerId, SharedConsensus};
     use raft_consensus::message::{ClientResponse, ConsensusTimeout, PeerMessage};
     use raft_consensus::persistent_log::mem::MemLog;
     use raft_consensus::state_machine::null::NullStateMachine;
     use tokio::executor::current_thread;
     use tokio_timer::Timer;
+    use raft::RaftPeerProtocol;
     use super::*;
 
     #[derive(Debug)]
@@ -149,8 +151,8 @@ mod tests {
         let mut nodes: HashMap<ServerId, SocketAddr> = HashMap::new();
         nodes.insert(1.into(), "127.0.0.1:9991".parse().unwrap());
         nodes.insert(2.into(), "127.0.0.1:9992".parse().unwrap());
-        nodes.insert(3.into(), "127.0.0.1:9993".parse().unwrap());
-        nodes.insert(4.into(), "127.0.0.1:9994".parse().unwrap());
+        //        nodes.insert(3.into(), "127.0.0.1:9993".parse().unwrap());
+        //        nodes.insert(4.into(), "127.0.0.1:9994".parse().unwrap());
         let mut threads = Vec::new();
 
         for (id, addr) in nodes.clone().into_iter() {
@@ -175,12 +177,15 @@ mod tests {
                         .collect::<Vec<_>>();
                     let log = MemLog::new();
                     let sm = NullStateMachine;
-                    let chandler = TokioHandler;
-                    let consensus = Consensus::new(id, peers.clone(), log, sm, chandler).unwrap();
-                    let consensus = SharedConsensus::new(consensus);
+                    //let consensus = Consensus::new(id, peers.clone(), log, sm, chandler).unwrap();
+                    //let consensus = SharedConsensus::new(consensus);
                     let conns = Connections(Arc::new(Mutex::new(HashMap::new())));
 
-                    let server = RaftServer::new(id, selfad, conns.clone()).into_future();
+                    let (tx, rx) = unbounded();
+                    let protocol = RaftPeerProtocol::new(rx, id, peers.clone(), log, sm);
+
+                    let server =
+                        RaftServer::new(id, selfad, conns.clone(), tx.clone()).into_future();
 
                     let mut enter = tokio_executor::enter().expect("Enter");
                     let reactor = tokio_reactor::Reactor::new().expect("reactor");
@@ -193,6 +198,9 @@ mod tests {
 
                     tokio_reactor::with_default(&handle, &mut enter, move |e| {
                         tokio_timer::with_default(&thandle, e, move |e| {
+                            exec.spawn(
+                                protocol.map_err(move |e| println!("Protocol error: {:?}", e)),
+                            );
                             exec.spawn(server.map_err(move |e| println!("SERVER ERROR {:?}", e)));
                             let remotes = nodes
                                 .iter()
@@ -201,10 +209,16 @@ mod tests {
                                 .collect::<Vec<_>>();
                             for addr in remotes {
                                 let client = RaftClient::new(id, addr, conns.clone());
+                                use tokio::timer::Delay;
+
                                 exec.spawn(
-                                    client
-                                        .into_future()
-                                        .map_err(move |e| println!("CLIENT ERROR {:?}", e)),
+                                    Delay::new(Instant::now() + Duration::from_millis(200))
+                                        .then(|_| Ok(()))
+                                        .and_then(|_| {
+                                            client
+                                                .into_future()
+                                                .map_err(move |e| println!("CLIENT ERROR {:?}", e))
+                                        }),
                                 );
                             }
 
