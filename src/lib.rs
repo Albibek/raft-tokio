@@ -31,10 +31,10 @@ use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
 use tokio::prelude::future::*;
-use tokio_io::codec::{Decoder, Encoder};
+use tokio_io::codec::{Decoder, Encoder, Framed};
 use bytes::BytesMut;
 
-use futures::sync::oneshot;
+use futures::sync::{oneshot, mpsc::UnboundedSender};
 
 use raft_consensus::{ClientId, Consensus, ConsensusHandler, ServerId, SharedConsensus};
 
@@ -51,14 +51,22 @@ pub struct RaftClient {
     id: ServerId,
     remote: SocketAddr,
     peers: Connections,
+    tx: UnboundedSender<(ServerId, Framed<TcpStream, RaftCodec>)>,
 }
 
 impl RaftClient {
-    pub fn new(id: ServerId, remote: SocketAddr, conns: Connections) -> Self {
+    pub fn new(
+        id: ServerId,
+        remote: SocketAddr,
+        conns: Connections,
+
+        tx: UnboundedSender<(ServerId, Framed<TcpStream, RaftCodec>)>,
+    ) -> Self {
         Self {
             id,
             remote,
             peers: conns,
+            tx,
         }
     }
 }
@@ -73,6 +81,7 @@ impl IntoFuture for RaftClient {
             id: selfid,
             remote,
             peers,
+            tx,
         } = self;
         let client = TcpStream::connect(&remote);
         let fut = client.and_then(move |stream| {
@@ -84,7 +93,11 @@ impl IntoFuture for RaftClient {
                     stream
                         .into_future()
                         .and_then(|(maybe_id, stream)| {
-                            let id = maybe_id.unwrap();
+                            // FIXME: process hello/ehlo correctly
+                            let id = match maybe_id.unwrap() {
+                                Handshake::Hello(id) => id,
+                                Handshake::Ehlo(id) => id,
+                            };
                             println!("handshake received {:?}", id);
                             Ok((id, stream.into_inner()))
                         })
@@ -93,7 +106,14 @@ impl IntoFuture for RaftClient {
                             e
                         })
                 })
-                .map(|(id, stream)| ());
+                .and_then(|(id, stream)| {
+                    let stream = stream.framed(RaftCodec);
+                    tx.send((id, stream))
+                        .map_err(|e| {
+                            println!("SEND ERROR: {:?}", e);
+                        })
+                        .then(|_| Ok(())) // TODO: process errors
+                });
 
             //let mut peers = peers.0.lock().unwrap();
             //let mut new = false;
@@ -208,7 +228,7 @@ mod tests {
                                 .map(|(_, addr)| *addr)
                                 .collect::<Vec<_>>();
                             for addr in remotes {
-                                let client = RaftClient::new(id, addr, conns.clone());
+                                let client = RaftClient::new(id, addr, conns.clone(), tx.clone());
                                 use tokio::timer::Delay;
 
                                 exec.spawn(
