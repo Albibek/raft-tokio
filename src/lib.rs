@@ -13,6 +13,7 @@ extern crate bytes;
 ///! care about side connection was made from.
 extern crate futures;
 extern crate raft_consensus;
+extern crate rand;
 extern crate rmp_serde;
 extern crate serde;
 #[macro_use]
@@ -85,52 +86,60 @@ impl IntoFuture for RaftClient {
         } = self;
         let client = TcpStream::connect(&remote);
         let fut = client.and_then(move |stream| {
-            println!("client {:?} connected to {:?}", selfid, remote);
+            println!("[{:?}] client connected to {:?}", selfid, remote);
             let framed = stream.framed(HandshakeCodec(selfid));
-            let fut = framed
+            framed
                 .send(Handshake::Hello(selfid))
-                .and_then(|stream| {
+                .and_then(move |stream| {
                     stream
                         .into_future()
-                        .and_then(|(maybe_id, stream)| {
+                        .and_then(move |(maybe_id, stream)| {
                             // FIXME: process hello/ehlo correctly
                             let id = match maybe_id.unwrap() {
                                 Handshake::Hello(id) => id,
                                 Handshake::Ehlo(id) => id,
                             };
-                            println!("handshake received {:?}", id);
+                            println!("[{:?}] handshake received {:?}", selfid, id);
                             Ok((id, stream.into_inner()))
                         })
                         .map_err(|(e, _)| {
-                            println!("handshake recv error");
+                            println!("error sending handshake response: {:?}", e);
                             e
                         })
-                })
-                .and_then(|(id, stream)| {
-                    let stream = stream.framed(RaftCodec);
-                    tx.send((id, stream))
-                        .map_err(|e| {
-                            println!("SEND ERROR: {:?}", e);
+                        .and_then(move |(id, stream)| {
+                            let dpeers =
+                                { peers.0.lock().unwrap().keys().cloned().collect::<Vec<_>>() };
+
+                            let mut new = false;
+                            {
+                                let mut peers = peers.0.lock().unwrap();
+                                peers.entry(id).or_insert_with(|| {
+                                    new = true;
+                                    let (tx, rx) = oneshot::channel();
+                                    Some(tx)
+                                });
+                            }
+                            if !new && selfid > id {
+                                //println!("neet to do something with old {:?}", remote);
+                                println!(
+                                "[{:?}] (client) duplicate connection with {:?}, skipping. {:?}",
+                                selfid, id, dpeers
+                            );
+                                Either::A(ok(()))
+                            } else {
+                                let stream = stream.framed(RaftCodec);
+                                Either::B(
+                                    tx.send((id, stream))
+                                        .map_err(|e| {
+                                            println!("SEND ERROR: {:?}", e);
+                                        })
+                                        .then(|_| Ok(())),
+                                ) // TODO: process errors
+                            }
                         })
-                        .then(|_| Ok(())) // TODO: process errors
-                });
-
-            //let mut peers = peers.0.lock().unwrap();
-            //let mut new = false;
-            //let mut remote = peers.entry(id).or_insert_with(|| {
-            //new = true;
-            //let (tx, rx) = oneshot::channel();
-            //Some(tx)
-            //});
-            //if !new {
-            //println!("neet to do something with old {:?}", remote)
-            //}
-
-            //Ok(stream.into_inner())
-            //});
-            Box::new(fut)
+                })
         });
-        Box::new(fut)
+        Box::new(fut.then(|_| Ok(())))
     }
 }
 
@@ -171,7 +180,7 @@ mod tests {
         let mut nodes: HashMap<ServerId, SocketAddr> = HashMap::new();
         nodes.insert(1.into(), "127.0.0.1:9991".parse().unwrap());
         nodes.insert(2.into(), "127.0.0.1:9992".parse().unwrap());
-        //        nodes.insert(3.into(), "127.0.0.1:9993".parse().unwrap());
+        nodes.insert(3.into(), "127.0.0.1:9993".parse().unwrap());
         //        nodes.insert(4.into(), "127.0.0.1:9994".parse().unwrap());
         let mut threads = Vec::new();
 
@@ -227,12 +236,13 @@ mod tests {
                                 .filter(|&(iid, addr)| if *iid != id { true } else { false })
                                 .map(|(_, addr)| *addr)
                                 .collect::<Vec<_>>();
+                            println!("{:?} wil conn to {:?}", id, remotes);
                             for addr in remotes {
                                 let client = RaftClient::new(id, addr, conns.clone(), tx.clone());
                                 use tokio::timer::Delay;
 
                                 exec.spawn(
-                                    Delay::new(Instant::now() + Duration::from_millis(200))
+                                    Delay::new(Instant::now() + Duration::from_millis(300))
                                         .then(|_| Ok(()))
                                         .and_then(|_| {
                                             client
@@ -243,7 +253,7 @@ mod tests {
                             }
 
                             exec.enter(e)
-                                .run_timeout(Duration::from_secs(10))
+                                .run_timeout(Duration::from_secs(30))
                                 .unwrap_or_else(|e| println!("loop done with err {:?}", e))
                         })
                     });

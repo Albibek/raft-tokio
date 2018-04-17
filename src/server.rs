@@ -60,11 +60,12 @@ impl IntoFuture for RaftServer {
             Err(e) => return Box::new(failed(e)),
         };
         let fut = listener.incoming().for_each(move |stream| {
-            let tx = tx.clone(); // TODO clone only after handshake passed
             let remote = stream.peer_addr().unwrap();
-            println!("{:?} connected", remote);
+            println!("[{:?}] client {:?} connected", selfid, remote);
             let framed = stream.framed(HandshakeCodec(selfid));
             let peers = peers.clone();
+
+            let tx = tx.clone(); // TODO clone only after handshake passed
             let fut = framed
                 .into_future()
                 .map_err(|(e, _)| {
@@ -72,38 +73,44 @@ impl IntoFuture for RaftServer {
                     e
                 })
                 .and_then(move |(maybe_id, stream)| {
-                    println!("server got ID {:?}", maybe_id);
+                    println!("[{:?}] server received ID {:?}", selfid, maybe_id);
                     let id = if let Handshake::Hello(id) = maybe_id.unwrap() {
                         id
                     } else {
+                        // TODO: return error
                         unimplemented!()
                     };
 
-                    let mut peers = peers.0.lock().unwrap();
-
-                    let (tx, rx) = oneshot::channel();
-                    let mut remote = peers.insert(id, Some(tx));
-                    if let Some(Some(remote)) = remote {
-                        if !remote.is_canceled() {
-                            println!("canceling");
-                            remote.send(()).unwrap();
-                        } else {
-                            println!("canceled");
-                        }
-                    }
-
                     stream
                         .send(Handshake::Hello(selfid))
-                        .map(move |stream| (stream, id, rx))
+                        .map(move |stream| (stream.into_inner(), id, peers))
                 })
-                .and_then(move |(stream, id, _rx)| {
-                    // TODO deal with rx
-                    let stream = stream.into_inner().framed(RaftCodec);
-                    tx.send((id, stream))
-                        .map_err(|e| {
-                            println!("SEND ERROR: {:?}", e);
-                        })
-                        .then(|_| Ok(())) // TODO: process errors
+                .and_then(move |(stream, id, peers)| {
+                    let mut new = false;
+                    {
+                        let mut peers = peers.0.lock().unwrap();
+                        let remote = peers.entry(id).or_insert_with(|| {
+                            new = true;
+                            let (tx, rx) = oneshot::channel();
+                            Some(tx)
+                        });
+                    }
+                    if !new && selfid < id {
+                        println!(
+                            "[{:?}] (server) duplicate connection with {:?}, skipping. {:?}",
+                            selfid, id, 1
+                        );
+                        Either::A(ok(()))
+                    } else {
+                        let stream = stream.framed(RaftCodec);
+                        Either::B(
+                            tx.send((id, stream))
+                                .map_err(|e| {
+                                    println!("SEND ERROR: {:?}", e);
+                                })
+                                .then(|_| Ok(())),
+                        ) // TODO: process errors
+                    }
                 });
             fut.then(|_| Ok(())) // this avoids server exit on connection errors
         });
