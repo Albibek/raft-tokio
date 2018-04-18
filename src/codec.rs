@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io;
 
 use tokio_io::codec::{Decoder, Encoder};
 use bytes::BytesMut;

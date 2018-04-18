@@ -1,4 +1,3 @@
-extern crate bytes;
 ///! # Connection handling.
 ///! In raft every node is equal to others. So main question here is, in TCP terms, which of nodes
 ///! should be a client and which of them should be a server. To solve this problem we make the
@@ -11,6 +10,7 @@ extern crate bytes;
 ///! * we run Raft client that is responsible for reconnecting and checking if a connection is lost
 ///! The rest of raft connection logic we hide in the `RaftDialog` which takes `TcpStream` and doesn't
 ///! care about side connection was made from.
+extern crate bytes;
 extern crate futures;
 extern crate raft_consensus;
 extern crate rand;
@@ -18,6 +18,9 @@ extern crate rmp_serde;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
+#[macro_use]
+extern crate slog;
+extern crate slog_stdlog;
 extern crate tokio;
 extern crate tokio_executor;
 extern crate tokio_io;
@@ -41,113 +44,24 @@ use raft_consensus::{ClientId, Consensus, ConsensusHandler, ServerId, SharedCons
 
 mod codec;
 mod server;
+mod client;
 mod raft;
+use client::RaftClient;
 use codec::*;
 use server::*;
 
 #[derive(Debug, Clone)]
 pub struct Connections(Arc<Mutex<HashMap<ServerId, Option<oneshot::Sender<()>>>>>);
 
-pub struct RaftClient {
-    id: ServerId,
-    remote: SocketAddr,
-    peers: Connections,
-    tx: UnboundedSender<(ServerId, Framed<TcpStream, RaftCodec>)>,
-}
-
-impl RaftClient {
-    pub fn new(
-        id: ServerId,
-        remote: SocketAddr,
-        conns: Connections,
-
-        tx: UnboundedSender<(ServerId, Framed<TcpStream, RaftCodec>)>,
-    ) -> Self {
-        Self {
-            id,
-            remote,
-            peers: conns,
-            tx,
-        }
-    }
-}
-
-impl IntoFuture for RaftClient {
-    type Item = ();
-    type Error = io::Error;
-    type Future = Box<Future<Item = Self::Item, Error = Self::Error> + Send>;
-
-    fn into_future(self) -> Self::Future {
-        let Self {
-            id: selfid,
-            remote,
-            peers,
-            tx,
-        } = self;
-        let client = TcpStream::connect(&remote);
-        let fut = client.and_then(move |stream| {
-            println!("[{:?}] client connected to {:?}", selfid, remote);
-            let framed = stream.framed(HandshakeCodec(selfid));
-            framed
-                .send(Handshake::Hello(selfid))
-                .and_then(move |stream| {
-                    stream
-                        .into_future()
-                        .and_then(move |(maybe_id, stream)| {
-                            // FIXME: process hello/ehlo correctly
-                            let id = match maybe_id.unwrap() {
-                                Handshake::Hello(id) => id,
-                                Handshake::Ehlo(id) => id,
-                            };
-                            println!("[{:?}] handshake received {:?}", selfid, id);
-                            Ok((id, stream.into_inner()))
-                        })
-                        .map_err(|(e, _)| {
-                            println!("error sending handshake response: {:?}", e);
-                            e
-                        })
-                        .and_then(move |(id, stream)| {
-                            let dpeers =
-                                { peers.0.lock().unwrap().keys().cloned().collect::<Vec<_>>() };
-
-                            let mut new = false;
-                            {
-                                let mut peers = peers.0.lock().unwrap();
-                                peers.entry(id).or_insert_with(|| {
-                                    new = true;
-                                    let (tx, rx) = oneshot::channel();
-                                    Some(tx)
-                                });
-                            }
-                            if !new && selfid > id {
-                                //println!("neet to do something with old {:?}", remote);
-                                println!(
-                                "[{:?}] (client) duplicate connection with {:?}, skipping. {:?}",
-                                selfid, id, dpeers
-                            );
-                                Either::A(ok(()))
-                            } else {
-                                let stream = stream.framed(RaftCodec);
-                                Either::B(
-                                    tx.send((id, stream))
-                                        .map_err(|e| {
-                                            println!("SEND ERROR: {:?}", e);
-                                        })
-                                        .then(|_| Ok(())),
-                                ) // TODO: process errors
-                            }
-                        })
-                })
-        });
-        Box::new(fut.then(|_| Ok(())))
-    }
-}
-
 #[cfg(test)]
 mod tests {
 
+    extern crate slog_async;
+    extern crate slog_term;
     use std::collections::HashMap;
     use std::thread;
+
+    use slog::Drain;
 
     use tokio;
     use tokio::prelude::*;
@@ -162,18 +76,8 @@ mod tests {
     use raft_consensus::persistent_log::mem::MemLog;
     use raft_consensus::state_machine::null::NullStateMachine;
     use tokio::executor::current_thread;
-    use tokio_timer::Timer;
     use raft::RaftPeerProtocol;
     use super::*;
-
-    #[derive(Debug)]
-    struct TokioHandler;
-    impl ConsensusHandler for TokioHandler {
-        fn send_peer_message(&mut self, id: ServerId, message: PeerMessage) {}
-        fn send_client_response(&mut self, id: ClientId, message: ClientResponse) {}
-        fn set_timeout(&mut self, timeout: ConsensusTimeout) {}
-        fn clear_timeout(&mut self, timeout: ConsensusTimeout) {}
-    }
 
     #[test]
     fn temp_test() {
@@ -183,14 +87,23 @@ mod tests {
         nodes.insert(3.into(), "127.0.0.1:9993".parse().unwrap());
         //        nodes.insert(4.into(), "127.0.0.1:9994".parse().unwrap());
         let mut threads = Vec::new();
+        // Set logging
+        let decorator = slog_term::TermDecorator::new().build();
+        let drain = slog_term::FullFormat::new(decorator).build().fuse();
+        let filter = slog::LevelFilter::new(drain, slog::Level::Debug).fuse();
+        let drain = slog_async::Async::new(filter).build().fuse();
+        let rlog = slog::Logger::root(drain, o!("program"=>"test"));
+        // this lets root logger live as long as it needs
+        //let _guard = slog_scope::set_global_logger(rlog.clone());
 
         for (id, addr) in nodes.clone().into_iter() {
             let nodes = nodes.clone();
 
+            let log = rlog.new(o!("id" => format!("{:?}", id), "remote" => format!("{:?}",addr)));
             let th = thread::Builder::new()
                 .name(format!("test-{:?}", id).to_string())
                 .spawn(move || {
-                    println!("test-{:?}{:?}", id, addr);
+                    let log = log.clone();
                     let (_, mut selfad) = nodes.clone().into_iter().next().unwrap();
                     let peers = nodes
                         .iter()
@@ -204,17 +117,18 @@ mod tests {
                         })
                         .map(|(iid, _)| *iid)
                         .collect::<Vec<_>>();
-                    let log = MemLog::new();
+                    let raft_log = MemLog::new();
                     let sm = NullStateMachine;
                     //let consensus = Consensus::new(id, peers.clone(), log, sm, chandler).unwrap();
                     //let consensus = SharedConsensus::new(consensus);
                     let conns = Connections(Arc::new(Mutex::new(HashMap::new())));
 
                     let (tx, rx) = unbounded();
-                    let protocol = RaftPeerProtocol::new(rx, id, peers.clone(), log, sm);
+                    let protocol = RaftPeerProtocol::new(rx, id, peers.clone(), raft_log, sm);
 
                     let server =
-                        RaftServer::new(id, selfad, conns.clone(), tx.clone()).into_future();
+                        RaftServer::new(id, selfad, conns.clone(), tx.clone(), log.clone())
+                            .into_future();
 
                     let mut enter = tokio_executor::enter().expect("Enter");
                     let reactor = tokio_reactor::Reactor::new().expect("reactor");
@@ -236,9 +150,15 @@ mod tests {
                                 .filter(|&(iid, addr)| if *iid != id { true } else { false })
                                 .map(|(_, addr)| *addr)
                                 .collect::<Vec<_>>();
-                            println!("{:?} wil conn to {:?}", id, remotes);
+                            warn!(log, "{:?} wil conn to {:?}", id, remotes);
                             for addr in remotes {
-                                let client = RaftClient::new(id, addr, conns.clone(), tx.clone());
+                                let client = RaftClient::new(
+                                    id,
+                                    addr,
+                                    conns.clone(),
+                                    tx.clone(),
+                                    log.clone(),
+                                );
                                 use tokio::timer::Delay;
 
                                 exec.spawn(

@@ -12,6 +12,8 @@ use bytes::BytesMut;
 use futures::sync::{oneshot, mpsc::UnboundedSender};
 
 use raft_consensus::{ClientId, Consensus, ConsensusHandler, ServerId, SharedConsensus};
+use slog::{Drain, Logger};
+use slog_stdlog;
 
 use codec::*;
 
@@ -24,20 +26,27 @@ pub struct RaftServer {
     listen: SocketAddr,
     peers: Connections,
     tx: UnboundedSender<(ServerId, Framed<TcpStream, RaftCodec>)>,
+    log: Logger,
 }
 
 impl RaftServer {
-    pub fn new(
+    pub fn new<L: Into<Option<Logger>>>(
         id: ServerId,
         listen: SocketAddr,
         conns: Connections,
         tx: UnboundedSender<(ServerId, Framed<TcpStream, RaftCodec>)>,
+        logger: L,
     ) -> Self {
+        let logger = logger
+            .into()
+            .unwrap_or(Logger::root(slog_stdlog::StdLog.fuse(), o!()));
+        let logger = logger.new(o!("id" => id.to_string()));
         Self {
             id,
             listen,
             peers: conns,
             tx,
+            log: logger,
         }
     }
 }
@@ -53,6 +62,7 @@ impl IntoFuture for RaftServer {
             listen,
             peers,
             tx,
+            log,
         } = self;
         let listener = TcpListener::bind(&listen);
         let listener = match listener {
@@ -61,7 +71,8 @@ impl IntoFuture for RaftServer {
         };
         let fut = listener.incoming().for_each(move |stream| {
             let remote = stream.peer_addr().unwrap();
-            println!("[{:?}] client {:?} connected", selfid, remote);
+            debug!(log, "client connected"; "addr" => remote.to_string());
+            //println!("[{:?}] client {:?} connected", selfid, remote);
             let framed = stream.framed(HandshakeCodec(selfid));
             let peers = peers.clone();
 

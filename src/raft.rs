@@ -163,15 +163,17 @@ where
         }
 
         let keys = self.conns.keys().cloned().collect::<Vec<ServerId>>();
+        //let log = self.log.new(o!("id" => self.id.into()));
 
         let mut remove = Vec::new();
         for id in keys.into_iter() {
-            let mut ready = false;
+            let mut ready;
             loop {
                 {
                     let conn = self.conns.get_mut(&id).unwrap();
                     match conn.poll() {
                         Ok(Async::Ready(None)) => {
+                            //                   debug!(log, "CONN ENDED"; "remote" => id.into());
                             println!("[{:?}] CONN ENDED {:?}", self.id, id);
                             //remove.push(id)
                             // TODO what if stream ends?
