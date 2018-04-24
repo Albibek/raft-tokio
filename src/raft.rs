@@ -1,24 +1,20 @@
-use std::{fmt, io, fmt::Debug};
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::io;
 use std::time::{Duration, Instant};
-use std::borrow::BorrowMut;
 use std::collections::HashMap;
 
-use futures::{Async, Future, IntoFuture, Poll, Sink, Stream, future::Either, future::select_all,
-              sync::mpsc::UnboundedReceiver};
+use futures::{Async, Future, Poll, Sink, Stream, sync::mpsc::UnboundedReceiver};
 use raft_consensus::{ClientId, Consensus, ConsensusHandler, Log, ServerId, StateMachine,
                      handler::CollectHandler,
                      message::{ClientResponse, ConsensusTimeout, PeerMessage}};
 use tokio::timer::Delay;
 use tokio;
 use rand::Rng;
+use error::Error;
 
 pub struct RaftPeerProtocol<S, L, M>
 where
-    S: Stream<Item = PeerMessage, Error = io::Error>
-        + Sink<SinkItem = PeerMessage, SinkError = io::Error>
+    S: Stream<Item = PeerMessage, Error = Error>
+        + Sink<SinkItem = PeerMessage, SinkError = Error>
         + Send,
     L: Log,
     M: StateMachine,
@@ -35,8 +31,8 @@ where
 
 impl<S, L, M> RaftPeerProtocol<S, L, M>
 where
-    S: Stream<Item = PeerMessage, Error = io::Error>
-        + Sink<SinkItem = PeerMessage, SinkError = io::Error>
+    S: Stream<Item = PeerMessage, Error = Error>
+        + Sink<SinkItem = PeerMessage, SinkError = Error>
         + Send,
     L: Log,
     M: StateMachine,
@@ -132,8 +128,8 @@ where
 
 impl<S, L, M> Future for RaftPeerProtocol<S, L, M>
 where
-    S: Stream<Item = PeerMessage, Error = io::Error>
-        + Sink<SinkItem = PeerMessage, SinkError = io::Error>
+    S: Stream<Item = PeerMessage, Error = Error>
+        + Sink<SinkItem = PeerMessage, SinkError = Error>
         + Send,
     L: Log,
     M: StateMachine,

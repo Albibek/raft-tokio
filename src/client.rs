@@ -1,36 +1,102 @@
-use std::io;
 use std::net::SocketAddr;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::prelude::*;
 use tokio::prelude::future::*;
-use tokio_io::codec::{Decoder, Encoder, Framed};
-use bytes::BytesMut;
+use tokio::timer::Delay;
+use tokio_io::codec::Framed;
 use Connections;
-use codec::{Handshake, HandshakeCodec, RaftCodec};
+use codec::RaftCodec;
+use handshake::*;
+use tokio_io::codec::{Decoder, Encoder};
 
+use raft_consensus::message::*;
 use slog::{Drain, Logger};
 use slog_stdlog;
 use futures::sync::{oneshot, mpsc::UnboundedSender};
+use error::Error;
 
-use raft_consensus::{ClientId, Consensus, ConsensusHandler, ServerId, SharedConsensus};
+use raft_consensus::ServerId;
 
-pub struct RaftClient {
-    id: ServerId,
+/// TCP client that is reconnecting forever until success
+pub struct TcpClient {
+    addr: SocketAddr,
+    timeout: Duration,
+}
+
+impl TcpClient {
+    pub fn new(addr: SocketAddr, timeout: Duration) -> Self {
+        Self { addr, timeout }
+    }
+}
+
+impl IntoFuture for TcpClient {
+    type Item = TcpStream;
+    type Error = Error;
+    type Future = Box<Future<Item = Self::Item, Error = Self::Error> + Send>;
+
+    fn into_future(self) -> Self::Future {
+        let Self { addr, timeout } = self;
+        let client = loop_fn(0, move |try| {
+            // on a first try timeout is 0
+            let clog = clog.clone();
+            let dur = if try == 0 {
+                Duration::from_millis(0)
+            } else {
+                timeout
+            };
+
+            let delay = Delay::new(Instant::now() + Duration::from_millis(dur)).then(|_| Ok(()));
+
+            delay.and_then(move |()| {
+                TcpStream::connect(&addr).then(move |res| match res {
+                    Ok(stream) => ok(Loop::Break(stream)),
+                    Err(e) => {
+                        info!(clog, "connection failed"; "error" => e.to_string());
+                        ok(Loop::Continue(try + 1))
+                    }
+                })
+            })
+        });
+        Box::new(client)
+    }
+}
+
+/// This future will handle all the actions required for raft to start
+/// H parameter should be a handshake future that is run on the stream before
+/// connection is passed to protocol. There are some ready handshakes in `handshake` module.
+/// S is a stream being passed. It can be TCP or UDP connection probably wrapped in TLS or any
+/// other wrapping required. Please note that connection must be established and ready to send
+/// packets
+/// R parameter is responsible for raft packets encoding
+pub struct RaftClient<S, H, R>
+where
+    S: Stream<Item = PeerMessage, Error = Error> + Sink<SinkItem = PeerMessage, SinkError = Error>,
+    H: Future<Item = (ServerId, S), Error = Error>,
+    R: Encoder<Item = PeerMessage, Error = Error> + Decoder<Item = PeerMessage, Error = Error>,
+{
+    self_id: ServerId,
     remote: SocketAddr,
     peers: Connections,
-    tx: UnboundedSender<(ServerId, Framed<TcpStream, RaftCodec>)>,
+    hs_future: H,
+    tx: UnboundedSender<(ServerId, Framed<S, R>)>,
     log: Logger,
 }
 
-impl RaftClient {
+impl<S, H, R> RaftClient<S, H, R>
+where
+    S: Stream<Item = PeerMessage, Error = Error> + Sink<SinkItem = PeerMessage, SinkError = Error>,
+    H: Future<Item = (ServerId, S), Error = Error>,
+    R: Encoder<Item = PeerMessage, Error = Error> + Decoder<Item = PeerMessage, Error = Error>,
+{
     pub fn new<L: Into<Option<Logger>>>(
-        id: ServerId,
+        self_id: ServerId,
         remote: SocketAddr,
         conns: Connections,
-        tx: UnboundedSender<(ServerId, Framed<TcpStream, RaftCodec>)>,
+        tx: UnboundedSender<(ServerId, Framed<S, R>)>,
+        hs_future: H,
+        raft_codec: R,
         logger: L,
     ) -> Self {
         let logger = logger
@@ -38,82 +104,84 @@ impl RaftClient {
             .unwrap_or(Logger::root(slog_stdlog::StdLog.fuse(), o!()));
 
         Self {
-            id,
+            self_id,
             remote,
             peers: conns,
+            hs_future,
             tx,
             log: logger,
         }
     }
 }
 
-impl IntoFuture for RaftClient {
+impl<S, H, R> IntoFuture for RaftClient<S, H, R>
+where
+    S: Stream<Item = PeerMessage, Error = Error> + Sink<SinkItem = PeerMessage, SinkError = Error>,
+    H: Future<Item = (ServerId, S), Error = Error>,
+    R: Encoder<Item = PeerMessage, Error = Error> + Decoder<Item = PeerMessage, Error = Error>,
+{
     type Item = ();
-    type Error = io::Error;
+    type Error = Error;
     type Future = Box<Future<Item = Self::Item, Error = Self::Error> + Send>;
 
     fn into_future(self) -> Self::Future {
         let Self {
-            id: selfid,
+            self_id,
             remote,
             peers,
             tx,
+            hs_future,
             log,
         } = self;
-        let client = TcpStream::connect(&remote);
-        let fut = client.and_then(move |stream| {
-            println!("[{:?}] client connected to {:?}", selfid, remote);
-            let framed = stream.framed(HandshakeCodec(selfid));
-            framed
-                .send(Handshake::Hello(selfid))
-                .and_then(move |stream| {
-                    stream
-                        .into_future()
-                        .and_then(move |(maybe_id, stream)| {
-                            // FIXME: process hello/ehlo correctly
-                            let id = match maybe_id.unwrap() {
-                                Handshake::Hello(id) => id,
-                                Handshake::Ehlo(id) => id,
-                            };
-                            println!("[{:?}] handshake received {:?}", selfid, id);
-                            Ok((id, stream.into_inner()))
-                        })
-                        .map_err(|(e, _)| {
-                            println!("error sending handshake response: {:?}", e);
-                            e
-                        })
-                        .and_then(move |(id, stream)| {
-                            let dpeers =
-                                { peers.0.lock().unwrap().keys().cloned().collect::<Vec<_>>() };
+        let clog = log.new(o!("client" => self_id.to_string(), "state" => "connecting"));
+        let flog = clog.clone();
+        let client = loop_fn(0, move |try| {
+            let clog = clog.clone();
+            let dur = if try == 0 {
+                0
+            } else {
+                // TODO configurable sleep
+                300
+            };
 
-                            let mut new = false;
-                            {
-                                let mut peers = peers.0.lock().unwrap();
-                                peers.entry(id).or_insert_with(|| {
-                                    new = true;
-                                    let (tx, rx) = oneshot::channel();
-                                    Some(tx)
-                                });
-                            }
-                            if !new && selfid > id {
-                                //println!("neet to do something with old {:?}", remote);
-                                println!(
-                                "[{:?}] (client) duplicate connection with {:?}, skipping. {:?}",
-                                selfid, id, dpeers
-                            );
-                                Either::A(ok(()))
-                            } else {
-                                let stream = stream.framed(RaftCodec);
-                                Either::B(
-                                    tx.send((id, stream))
-                                        .map_err(|e| {
-                                            println!("SEND ERROR: {:?}", e);
-                                        })
-                                        .then(|_| Ok(())),
-                                ) // TODO: process errors
-                            }
-                        })
+            let delay = Delay::new(Instant::now() + Duration::from_millis(dur)).then(|_| Ok(()));
+
+            delay.and_then(move |()| {
+                TcpStream::connect(&remote).then(move |res| match res {
+                    Ok(stream) => ok(Loop::Break(stream)),
+                    Err(e) => {
+                        info!(clog, "connection failed"; "error" => e.to_string());
+                        ok(Loop::Continue(try + 1))
+                    }
                 })
+            })
+        });
+        let fut = client.and_then(move |stream| {
+            info!(flog, "client connected"; "client" => remote.to_string());
+            hs_future.and_then(move |(id, stream)| {
+                let dpeers = { peers.0.lock().unwrap().keys().cloned().collect::<Vec<_>>() };
+
+                let mut new = false;
+                {
+                    let mut peers = peers.0.lock().unwrap();
+                    peers.entry(id).or_insert_with(|| {
+                        new = true;
+                        let (tx, rx) = oneshot::channel();
+                        Some(tx)
+                    });
+                }
+                if !new && self_id > id {
+                    info!(flog, "duplicate connection"; "remote_id" => id.to_string());
+                    Either::A(ok(()))
+                } else {
+                    let stream = stream.framed(RaftCodec);
+                    Either::B(
+                        tx.send((id, stream))
+                            .map_err(Error::SendConnection)
+                            .then(|_| Ok(())),
+                    ) // TODO: process errors
+                }
+            })
         });
         Box::new(fut.then(|_| Ok(())))
     }

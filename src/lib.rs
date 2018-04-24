@@ -1,16 +1,26 @@
+extern crate bytes;
+///! This is an implementation of Raft's networking(i.e. non-consensus) part using tokio framework
+///! intended to work with raft-consensus crate where the consensus logic is implemented
+///!
+///! What exactly is implemented:
+///! * Timers
+///! * Connecting and reconnecting
+///! * Decoding messages from network and passing them to consensus
+///! * (Obviously) taking messages consensus required to generate and passing them to network
+///!
 ///! # Connection handling.
 ///! In raft every node is equal to others. So main question here is, in TCP terms, which of nodes
 ///! should be a client and which of them should be a server. To solve this problem we make the
-///! both sides to try to connect and make a last side able to do this win.
+///! both sides to try to connect and make a last side able to do this win. To work around
+///! total symmetry we add a rule: the connection with bigger ID wins
 ///! For achieving such behaviour we do the following:
 ///! * we introduce a node-global shared `Connections` structure where all alive connections
 ///! are accounted
 ///! * we consider an active connection the one that that passed the handshake
-///! * we run Raft server that accepts client connections replacing anything in `Connections`
-///! * we run Raft client that is responsible for reconnecting and checking if a connection is lost
-///! The rest of raft connection logic we hide in the `RaftDialog` which takes `TcpStream` and doesn't
-///! care about side connection was made from.
-extern crate bytes;
+///! * established connection (no matter what side from) is passed to protocol via channel
+extern crate failure;
+#[macro_use]
+extern crate failure_derive;
 extern crate futures;
 extern crate raft_consensus;
 extern crate rand;
@@ -22,48 +32,40 @@ extern crate serde_derive;
 extern crate slog;
 extern crate slog_stdlog;
 extern crate tokio;
-extern crate tokio_executor;
 extern crate tokio_io;
-extern crate tokio_reactor;
-extern crate tokio_timer;
 
-use std::io;
-use std::net::SocketAddr;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use tokio::net::{TcpListener, TcpStream};
-use tokio::prelude::*;
-use tokio::prelude::future::*;
-use tokio_io::codec::{Decoder, Encoder, Framed};
-use bytes::BytesMut;
+use futures::sync::oneshot;
 
-use futures::sync::{oneshot, mpsc::UnboundedSender};
+use raft_consensus::ServerId;
 
-use raft_consensus::{ClientId, Consensus, ConsensusHandler, ServerId, SharedConsensus};
-
-mod codec;
-mod server;
-mod client;
-mod raft;
-use client::RaftClient;
-use codec::*;
-use server::*;
+pub mod codec;
+pub mod server;
+pub mod client;
+pub mod raft;
+pub mod error;
+pub mod handshake;
 
 #[derive(Debug, Clone)]
 pub struct Connections(Arc<Mutex<HashMap<ServerId, Option<oneshot::Sender<()>>>>>);
 
 #[cfg(test)]
 mod tests {
+    extern crate tokio_executor;
+    extern crate tokio_reactor;
+    extern crate tokio_timer;
 
     extern crate slog_async;
     extern crate slog_term;
     use std::collections::HashMap;
     use std::thread;
+    use std::sync::{Arc, Mutex};
 
+    use {slog, tokio};
+    use Connections;
     use slog::Drain;
-
-    use tokio;
     use tokio::prelude::*;
     use tokio::prelude::future::*;
     use tokio::util::FutureExt;
@@ -77,7 +79,8 @@ mod tests {
     use raft_consensus::state_machine::null::NullStateMachine;
     use tokio::executor::current_thread;
     use raft::RaftPeerProtocol;
-    use super::*;
+    use server::RaftServer;
+    use client::RaftClient;
 
     #[test]
     fn temp_test() {
@@ -151,6 +154,8 @@ mod tests {
                                 .map(|(_, addr)| *addr)
                                 .collect::<Vec<_>>();
                             warn!(log, "{:?} wil conn to {:?}", id, remotes);
+                            let conn = TcpClient::new(remote, Duration::from_millis(300));
+                            let hs_fu = HelloHandshake::from_stream(conn);
                             for addr in remotes {
                                 let client = RaftClient::new(
                                     id,
