@@ -10,25 +10,11 @@ use rmp_serde::decode::from_read;
 use rmp_serde::encode::write;
 
 use error::Error;
-//I: IntoFuture<Item = (ServerId, S), Error = Error, Future = F>,
-//F: Future<Item = (ServerId, S), Error = Error>,
-pub trait Handshake<S>
-where
-    S: Stream<Item = PeerMessage, Error = Error> + Sink<SinkItem = PeerMessage, SinkError = Error>,
-{
-    fn from_stream(self_id: ServerId, stream: S) -> Self;
-}
-
-//impl From<HelloHandshakeMessage> for ServerId {
-//fn from(hs: Handshake) -> Self {
-//1.into()
-//}
-//}
 
 /// A simple hello-ehlo handshake. ServerId is sent in both directions.
 pub struct HelloHandshake<S>
 where
-    S: Stream<Item = PeerMessage, Error = Error> + Sink<SinkItem = PeerMessage, SinkError = Error>,
+    S: AsyncRead + AsyncWrite,
 {
     self_id: ServerId,
     stream: S,
@@ -37,18 +23,13 @@ where
 
 impl<S> HelloHandshake<S>
 where
-    S: Stream<Item = PeerMessage, Error = Error> + Sink<SinkItem = PeerMessage, SinkError = Error>,
+    S: AsyncRead + AsyncWrite,
 {
     pub fn set_direction(&mut self, client_server: bool) {
         self.direction = client_server;
     }
-}
 
-impl<S> Handshake<S> for HelloHandshake<S>
-where
-    S: Stream<Item = PeerMessage, Error = Error> + Sink<SinkItem = PeerMessage, SinkError = Error>,
-{
-    fn from_stream(self_id: ServerId, stream: S) -> Self {
+    pub fn new(self_id: ServerId, stream: S) -> Self {
         Self {
             self_id,
             stream,
@@ -59,7 +40,7 @@ where
 
 impl<S> IntoFuture for HelloHandshake<S>
 where
-    S: Stream<Item = PeerMessage, Error = Error> + Sink<SinkItem = PeerMessage, SinkError = Error>,
+    S: AsyncRead + AsyncWrite,
 {
     type Item = (ServerId, S);
     type Error = Error;
@@ -75,13 +56,16 @@ where
         if direction {
             let future = framed.send(HelloHandshakeMessage::Hello(self_id)).and_then(
                 move |stream| {
-                    stream.into_future().and_then(move |(id, stream)| {
-                        if let Some(Handshake::Ehlo(id)) = id {
-                            Either::A(ok(id, stream.into_inner()))
-                        } else {
-                            Either::B(failed(Error::Handshake))
-                        }
-                    })
+                    stream
+                        .into_future()
+                        .map_err(|(e, _)| e)
+                        .and_then(move |(id, stream)| {
+                            if let Some(HelloHandshakeMessage::Ehlo(id)) = id {
+                                Either::A(ok((id, stream.into_inner())))
+                            } else {
+                                Either::B(failed(Error::Handshake))
+                            }
+                        })
                     //.map_err(|(e, _)| {
                     ////     println!("error sending handshake response: {:?}", e);
                     //e
@@ -97,7 +81,7 @@ where
                     e
                 })
                 .and_then(move |(maybe_id, stream)| {
-                    let id = if let Handshake::Hello(id) = maybe_id.unwrap() {
+                    let id = if let HelloHandshakeMessage::Hello(id) = maybe_id.unwrap() {
                         id
                     } else {
                         return Either::A(failed(Error::Handshake));
@@ -106,7 +90,7 @@ where
                     //debug!(log1, "Handshake success"; "remote_id" => id.to_string());
                     Either::B(
                         stream
-                            .send(Handshake::Ehlo(self_id))
+                            .send(HelloHandshakeMessage::Ehlo(self_id))
                             .map(move |stream| (id, stream.into_inner())),
                     )
                 });
@@ -130,7 +114,7 @@ impl Decoder for HelloHandshakeCodec {
         if src.len() == 0 {
             return Ok(None);
         }
-        let message: Handshake =
+        let message: HelloHandshakeMessage =
             from_read(src.take().into_buf().reader()).map_err(Error::Decoding)?;
         Ok(Some(message))
     }

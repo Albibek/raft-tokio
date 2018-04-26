@@ -80,7 +80,9 @@ mod tests {
     use tokio::executor::current_thread;
     use raft::RaftPeerProtocol;
     use server::RaftServer;
-    use client::RaftClient;
+    use client::{RaftClient, TcpClient};
+    use handshake::HelloHandshake;
+    use codec::RaftCodec;
 
     #[test]
     fn temp_test() {
@@ -153,16 +155,19 @@ mod tests {
                                 .filter(|&(iid, addr)| if *iid != id { true } else { false })
                                 .map(|(_, addr)| *addr)
                                 .collect::<Vec<_>>();
-                            warn!(log, "{:?} wil conn to {:?}", id, remotes);
-                            let conn = TcpClient::new(remote, Duration::from_millis(300));
-                            let hs_fu = HelloHandshake::from_stream(conn);
                             for addr in remotes {
+                                warn!(log, "connecting to {:?}", addr);
+                                let conn = TcpClient::new(addr, Duration::from_millis(300));
+                                let handshake = HelloHandshake::new(id, conn);
+                                let codec = RaftCodec;
                                 let client = RaftClient::new(
                                     id,
                                     addr,
                                     conns.clone(),
                                     tx.clone(),
-                                    log.clone(),
+                                    //                                   handshake.into_future(),
+                                    codec,
+                                    // log.clone(),
                                 );
                                 use tokio::timer::Delay;
 

@@ -20,7 +20,7 @@ pub enum Error {
     Handshake,
     #[fail(display = "Sending connection to protocol handler")]
     SendConnection,
-    #[fail(display = "Third party error: {}", _0)]
+    #[fail(display = "Third party error: {:?}", _0)]
     Other(Option<String>),
 }
 

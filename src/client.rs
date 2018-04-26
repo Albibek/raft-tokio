@@ -40,20 +40,19 @@ impl IntoFuture for TcpClient {
         let Self { addr, timeout } = self;
         let client = loop_fn(0, move |try| {
             // on a first try timeout is 0
-            let clog = clog.clone();
             let dur = if try == 0 {
                 Duration::from_millis(0)
             } else {
                 timeout
             };
 
-            let delay = Delay::new(Instant::now() + Duration::from_millis(dur)).then(|_| Ok(()));
+            let delay = Delay::new(Instant::now() + dur).then(|_| Ok(()));
 
             delay.and_then(move |()| {
                 TcpStream::connect(&addr).then(move |res| match res {
                     Ok(stream) => ok(Loop::Break(stream)),
                     Err(e) => {
-                        info!(clog, "connection failed"; "error" => e.to_string());
+                        //            info!(clog, "connection failed"; "error" => e.to_string());
                         ok(Loop::Continue(try + 1))
                     }
                 })
@@ -64,60 +63,55 @@ impl IntoFuture for TcpClient {
 }
 
 /// This future will handle all the actions required for raft to start
-/// H parameter should be a handshake future that is run on the stream before
-/// connection is passed to protocol. There are some ready handshakes in `handshake` module.
 /// S is a stream being passed. It can be TCP or UDP connection probably wrapped in TLS or any
 /// other wrapping required. Please note that connection must be established and ready to send
 /// packets
 /// R parameter is responsible for raft packets encoding
-pub struct RaftClient<S, H, R>
+pub struct RaftClient<S, R>
 where
-    S: Stream<Item = PeerMessage, Error = Error> + Sink<SinkItem = PeerMessage, SinkError = Error>,
-    H: Future<Item = (ServerId, S), Error = Error>,
+    S: AsyncRead + AsyncWrite,
     R: Encoder<Item = PeerMessage, Error = Error> + Decoder<Item = PeerMessage, Error = Error>,
 {
     self_id: ServerId,
     remote: SocketAddr,
     peers: Connections,
-    hs_future: H,
     tx: UnboundedSender<(ServerId, Framed<S, R>)>,
-    log: Logger,
+    codec: R,
+    // log: Logger,
 }
 
-impl<S, H, R> RaftClient<S, H, R>
+impl<S, R> RaftClient<S, R>
 where
-    S: Stream<Item = PeerMessage, Error = Error> + Sink<SinkItem = PeerMessage, SinkError = Error>,
-    H: Future<Item = (ServerId, S), Error = Error>,
+    S: AsyncRead + AsyncWrite,
     R: Encoder<Item = PeerMessage, Error = Error> + Decoder<Item = PeerMessage, Error = Error>,
 {
-    pub fn new<L: Into<Option<Logger>>>(
+    //pub fn new<L: Into<Option<Logger>>>(
+    pub fn new(
         self_id: ServerId,
         remote: SocketAddr,
-        conns: Connections,
+        peers: Connections,
         tx: UnboundedSender<(ServerId, Framed<S, R>)>,
-        hs_future: H,
-        raft_codec: R,
-        logger: L,
+        codec: R,
+        //       logger: L,
     ) -> Self {
-        let logger = logger
-            .into()
-            .unwrap_or(Logger::root(slog_stdlog::StdLog.fuse(), o!()));
+        // let logger = logger
+        //.into()
+        //.unwrap_or(Logger::root(slog_stdlog::StdLog.fuse(), o!()));
 
         Self {
             self_id,
             remote,
-            peers: conns,
-            hs_future,
+            peers,
             tx,
-            log: logger,
+            codec,
+            //            log: logger,
         }
     }
 }
 
-impl<S, H, R> IntoFuture for RaftClient<S, H, R>
+impl<S, R> IntoFuture for RaftClient<S, R>
 where
-    S: Stream<Item = PeerMessage, Error = Error> + Sink<SinkItem = PeerMessage, SinkError = Error>,
-    H: Future<Item = (ServerId, S), Error = Error>,
+    S: AsyncRead + AsyncWrite,
     R: Encoder<Item = PeerMessage, Error = Error> + Decoder<Item = PeerMessage, Error = Error>,
 {
     type Item = ();
@@ -130,13 +124,13 @@ where
             remote,
             peers,
             tx,
-            hs_future,
-            log,
+            codec,
+            //    log,
         } = self;
-        let clog = log.new(o!("client" => self_id.to_string(), "state" => "connecting"));
-        let flog = clog.clone();
+        //let clog = log.new(o!("client" => self_id.to_string(), "state" => "connecting"));
+        //let flog = clog.clone();
         let client = loop_fn(0, move |try| {
-            let clog = clog.clone();
+            //   let clog = clog.clone();
             let dur = if try == 0 {
                 0
             } else {
@@ -150,15 +144,15 @@ where
                 TcpStream::connect(&remote).then(move |res| match res {
                     Ok(stream) => ok(Loop::Break(stream)),
                     Err(e) => {
-                        info!(clog, "connection failed"; "error" => e.to_string());
+                        //              info!(clog, "connection failed"; "error" => e.to_string());
                         ok(Loop::Continue(try + 1))
                     }
                 })
             })
         });
         let fut = client.and_then(move |stream| {
-            info!(flog, "client connected"; "client" => remote.to_string());
-            hs_future.and_then(move |(id, stream)| {
+            // info!(flog, "client connected"; "client" => remote.to_string());
+            handshake.and_then(move |(id, stream)| {
                 let dpeers = { peers.0.lock().unwrap().keys().cloned().collect::<Vec<_>>() };
 
                 let mut new = false;
@@ -171,13 +165,13 @@ where
                     });
                 }
                 if !new && self_id > id {
-                    info!(flog, "duplicate connection"; "remote_id" => id.to_string());
+                    //    info!(flog, "duplicate connection"; "remote_id" => id.to_string());
                     Either::A(ok(()))
                 } else {
-                    let stream = stream.framed(RaftCodec);
+                    let stream = stream.framed(codec);
                     Either::B(
                         tx.send((id, stream))
-                            .map_err(Error::SendConnection)
+                            .map_err(|_| Error::SendConnection)
                             .then(|_| Ok(())),
                     ) // TODO: process errors
                 }
