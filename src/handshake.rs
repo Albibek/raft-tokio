@@ -11,54 +11,78 @@ use rmp_serde::encode::write;
 
 use error::Error;
 
-/// A simple hello-ehlo handshake. ServerId is sent in both directions.
-pub struct HelloHandshake<S>
+pub trait Handshake<S>
 where
-    S: AsyncRead + AsyncWrite,
+    S: AsyncRead + AsyncWrite + Send + 'static,
 {
-    self_id: ServerId,
-    stream: S,
-    direction: bool,
+    type Future: Future<Item = (ServerId, S), Error = Error> + Send + 'static;
+    /// Supposed to return future, should be implemented like into_future
+    fn from_stream(self, stream: S) -> Self::Future;
 }
 
-impl<S> HelloHandshake<S>
+pub trait HandshakeExt<S>
 where
-    S: AsyncRead + AsyncWrite,
+    S: AsyncRead + AsyncWrite + Send + 'static,
 {
-    pub fn set_direction(&mut self, client_server: bool) {
-        self.direction = client_server;
+    fn with_handshake<H>(self, handshake: H) -> H::Future
+    where
+        Self: Sized,
+        H: Handshake<S>;
+}
+
+impl<S> HandshakeExt<S> for S
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    fn with_handshake<H>(self, handshake: H) -> H::Future
+    where
+        Self: Sized,
+        H: Handshake<Self>,
+    {
+        handshake.from_stream(self)
+    }
+}
+
+//TODO add list of allowed serverid-s
+/// A simple hello-ehlo handshake. ServerId is sent in both directions.
+/// S is a connection being worked on. It can be any async read/write.
+/// The most useful cases, of course are TCP or UDP connection probably wrapped in TLS or any
+/// other wrapping required. Please note that in case of TCP, connection must be established and
+/// ready to send packets
+#[derive(Clone, Debug)]
+pub struct HelloHandshake {
+    self_id: ServerId,
+    is_client: bool,
+}
+
+impl HelloHandshake {
+    /// Set a direction of handshake to select client or server-side
+    pub fn set_is_client(&mut self, is_client: bool) {
+        self.is_client = is_client;
     }
 
-    pub fn new(self_id: ServerId, stream: S) -> Self {
+    pub fn new(self_id: ServerId) -> Self {
         Self {
             self_id,
-            stream,
-            direction: true,
+            is_client: true,
         }
     }
 }
 
-impl<S> IntoFuture for HelloHandshake<S>
+impl<S> Handshake<S> for HelloHandshake
 where
-    S: AsyncRead + AsyncWrite,
+    S: AsyncRead + AsyncWrite + Send + 'static,
 {
-    type Item = (ServerId, S);
-    type Error = Error;
-    type Future = Box<Future<Item = Self::Item, Error = Self::Error>>;
-
-    fn into_future(self) -> Self::Future {
-        let Self {
-            self_id,
-            stream,
-            direction,
-        } = self;
+    type Future = Box<Future<Item = (ServerId, S), Error = Error> + Send>;
+    fn from_stream(self, stream: S) -> Self::Future {
+        let Self { self_id, is_client } = self;
         let framed = stream.framed(HelloHandshakeCodec(self_id));
-        if direction {
+        if is_client {
             let future = framed.send(HelloHandshakeMessage::Hello(self_id)).and_then(
                 move |stream| {
                     stream
                         .into_future()
-                        .map_err(|(e, _)| e)
+                        .map_err(|(e, _)| e) // second error is send error, we don't need it
                         .and_then(move |(id, stream)| {
                             if let Some(HelloHandshakeMessage::Ehlo(id)) = id {
                                 Either::A(ok((id, stream.into_inner())))
@@ -66,34 +90,25 @@ where
                                 Either::B(failed(Error::Handshake))
                             }
                         })
-                    //.map_err(|(e, _)| {
-                    ////     println!("error sending handshake response: {:?}", e);
-                    //e
-                    //})
                 },
             );
             Box::new(future)
         } else {
-            let future = framed
-                .into_future()
-                .map_err(move |(e, _)| {
-                    //warn!(elog, "framed err"; "error" => e.to_string());
-                    e
-                })
-                .and_then(move |(maybe_id, stream)| {
+            let future = framed.into_future().map_err(move |(e, _)| e).and_then(
+                move |(maybe_id, stream)| {
                     let id = if let HelloHandshakeMessage::Hello(id) = maybe_id.unwrap() {
                         id
                     } else {
                         return Either::A(failed(Error::Handshake));
                     };
 
-                    //debug!(log1, "Handshake success"; "remote_id" => id.to_string());
                     Either::B(
                         stream
                             .send(HelloHandshakeMessage::Ehlo(self_id))
                             .map(move |stream| (id, stream.into_inner())),
                     )
-                });
+                },
+            );
             Box::new(future)
         }
     }

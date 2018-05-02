@@ -42,8 +42,7 @@ use futures::sync::oneshot;
 use raft_consensus::ServerId;
 
 pub mod codec;
-pub mod server;
-pub mod client;
+pub mod tcp;
 pub mod raft;
 pub mod error;
 pub mod handshake;
@@ -69,6 +68,7 @@ mod tests {
     use tokio::prelude::*;
     use tokio::prelude::future::*;
     use tokio::util::FutureExt;
+    use tokio::timer::Delay;
     use std::time::{Duration, Instant};
     use tokio::net::TcpStream;
     use std::net::SocketAddr;
@@ -78,11 +78,11 @@ mod tests {
     use raft_consensus::persistent_log::mem::MemLog;
     use raft_consensus::state_machine::null::NullStateMachine;
     use tokio::executor::current_thread;
-    use raft::RaftPeerProtocol;
-    use server::RaftServer;
-    use client::{RaftClient, TcpClient};
+    use raft::{RaftPeerProtocol, RaftStart};
+    use tcp::*;
     use handshake::HelloHandshake;
     use codec::RaftCodec;
+    use error::Error;
 
     #[test]
     fn temp_test() {
@@ -108,7 +108,10 @@ mod tests {
             let th = thread::Builder::new()
                 .name(format!("test-{:?}", id).to_string())
                 .spawn(move || {
+                    // prepare logger
                     let log = log.clone();
+
+                    // get list of nodes as all except self_id
                     let (_, mut selfad) = nodes.clone().into_iter().next().unwrap();
                     let peers = nodes
                         .iter()
@@ -122,19 +125,23 @@ mod tests {
                         })
                         .map(|(iid, _)| *iid)
                         .collect::<Vec<_>>();
+
+                    // prepare consensus
                     let raft_log = MemLog::new();
                     let sm = NullStateMachine;
-                    //let consensus = Consensus::new(id, peers.clone(), log, sm, chandler).unwrap();
-                    //let consensus = SharedConsensus::new(consensus);
                     let conns = Connections(Arc::new(Mutex::new(HashMap::new())));
 
+                    // Prepare peer protocol handler
                     let (tx, rx) = unbounded();
                     let protocol = RaftPeerProtocol::new(rx, id, peers.clone(), raft_log, sm);
 
-                    let server =
-                        RaftServer::new(id, selfad, conns.clone(), tx.clone(), log.clone())
-                            .into_future();
+                    // select protocol handshake type
+                    let handshake = HelloHandshake::new(id);
 
+                    // select protocol codec type
+                    let codec = RaftCodec;
+
+                    let server = empty::<(), Error>();
                     let mut enter = tokio_executor::enter().expect("Enter");
                     let reactor = tokio_reactor::Reactor::new().expect("reactor");
 
@@ -146,10 +153,26 @@ mod tests {
 
                     tokio_reactor::with_default(&handle, &mut enter, move |e| {
                         tokio_timer::with_default(&thandle, e, move |e| {
+                            // Spawn protocol actor
                             exec.spawn(
                                 protocol.map_err(move |e| println!("Protocol error: {:?}", e)),
                             );
+
+                            // spawn TCP server
+                            let mut srv_handshake = handshake.clone();
+                            srv_handshake.set_is_client(false);
+                            let server = TcpServer::new(
+                                id,
+                                selfad,
+                                conns.clone(),
+                                tx.clone(),
+                                codec.clone(),
+                                srv_handshake,
+                                log.clone(),
+                            ).into_future();
+
                             exec.spawn(server.map_err(move |e| println!("SERVER ERROR {:?}", e)));
+
                             let remotes = nodes
                                 .iter()
                                 .filter(|&(iid, addr)| if *iid != id { true } else { false })
@@ -158,25 +181,29 @@ mod tests {
                             for addr in remotes {
                                 warn!(log, "connecting to {:?}", addr);
                                 let conn = TcpClient::new(addr, Duration::from_millis(300));
-                                let handshake = HelloHandshake::new(id, conn);
-                                let codec = RaftCodec;
-                                let client = RaftClient::new(
-                                    id,
-                                    addr,
-                                    conns.clone(),
-                                    tx.clone(),
-                                    //                                   handshake.into_future(),
-                                    codec,
-                                    // log.clone(),
-                                );
-                                use tokio::timer::Delay;
 
+                                let conns = conns.clone();
+                                let tx = tx.clone();
+                                let mut client_handshake = handshake.clone();
+                                client_handshake.set_is_client(true);
+                                let codec = codec.clone();
+                                let client_future = conn.into_future().and_then(move |stream| {
+                                    let mut start = RaftStart::new(
+                                        id,
+                                        conns,
+                                        tx,
+                                        stream,
+                                        codec,
+                                        client_handshake,
+                                    );
+                                    start.set_is_client(true);
+                                    start
+                                });
                                 exec.spawn(
                                     Delay::new(Instant::now() + Duration::from_millis(300))
                                         .then(|_| Ok(()))
                                         .and_then(|_| {
-                                            client
-                                                .into_future()
+                                            client_future
                                                 .map_err(move |e| println!("CLIENT ERROR {:?}", e))
                                         }),
                                 );

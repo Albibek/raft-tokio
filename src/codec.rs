@@ -9,7 +9,10 @@ use rmp_serde::encode::write;
 
 use error::Error;
 
+#[derive(Clone, Debug)]
 pub struct RaftCodec;
+
+// TODO: generalize codec on any Serialize/Deserialize
 
 impl Decoder for RaftCodec {
     type Item = PeerMessage;

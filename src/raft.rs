@@ -1,16 +1,117 @@
 use std::io;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 
-use futures::{Async, Future, Poll, Sink, Stream, sync::mpsc::UnboundedReceiver};
+use futures::{Async, Future, Poll, Sink, Stream, future::Either,
+              sync::mpsc::{UnboundedReceiver, UnboundedSender}, sync::oneshot};
+
 use raft_consensus::{ClientId, Consensus, ConsensusHandler, Log, ServerId, StateMachine,
                      handler::CollectHandler,
                      message::{ClientResponse, ConsensusTimeout, PeerMessage}};
 use tokio::timer::Delay;
-use tokio;
+use tokio_io::{AsyncRead, AsyncWrite, codec::{Decoder, Encoder, Framed}};
+use tokio::prelude::*;
+use tokio::prelude::future::*;
+
 use rand::Rng;
 use error::Error;
+use handshake::{Handshake, HandshakeExt};
 
+use Connections;
+
+/// This future will handle all the actions required for raft to start:
+/// perform a handshake, save the conection and pass it through channel to raft dialog if everything is OK
+/// S is a stream being passed.
+/// C parameter is responsible for raft packets encoding
+/// H is a future supposed to make a handshake returning ServerId and the rest of the stream as a
+/// result
+#[derive(Clone)]
+pub struct RaftStart<S, C, H> {
+    self_id: ServerId,
+    peers: Connections,
+    tx: UnboundedSender<(ServerId, Framed<S, C>)>,
+    stream: S,
+    handshake: H,
+    codec: C,
+    is_client: bool,
+}
+
+impl<S, C, H> RaftStart<S, C, H> where {
+    pub fn new(
+        self_id: ServerId,
+        peers: Connections,
+        tx: UnboundedSender<(ServerId, Framed<S, C>)>,
+        stream: S,
+        codec: C,
+        handshake: H,
+    ) -> Self {
+        Self {
+            self_id,
+            peers,
+            tx,
+            stream,
+            codec,
+            handshake,
+            is_client: true,
+        }
+    }
+
+    pub fn set_is_client(&mut self, is_client: bool) {
+        self.is_client = is_client
+    }
+}
+
+impl<S, C, H> IntoFuture for RaftStart<S, C, H>
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+    C: Encoder<Item = PeerMessage, Error = Error>
+        + Decoder<Item = PeerMessage, Error = Error>
+        + Send
+        + 'static,
+    H: Handshake<S>,
+{
+    type Item = ();
+    type Error = Error;
+    type Future = Box<Future<Item = Self::Item, Error = Self::Error> + Send>;
+
+    fn into_future(self) -> Self::Future {
+        let Self {
+            self_id,
+            peers,
+            tx,
+            stream,
+            codec,
+            handshake,
+            is_client,
+        } = self;
+        let fut = stream
+            .with_handshake(handshake)
+            .and_then(move |(id, stream)| {
+                let mut new = false;
+                {
+                    let mut peers = peers.0.lock().unwrap();
+                    peers.entry(id).or_insert_with(|| {
+                        new = true;
+                        let (tx, rx) = oneshot::channel();
+                        Some(tx)
+                    });
+                }
+                let is_winner = if is_client {
+                    self_id > id
+                } else {
+                    id > self_id
+                };
+                if !new && is_winner {
+                    Either::A(failed(Error::DuplicateConnection(id)))
+                } else {
+                    let stream = stream.framed(codec);
+                    Either::B(tx.send((id, stream)).map_err(|_| Error::SendConnection))
+                }
+            });
+        Box::new(fut.then(|_| Ok(())))
+    }
+}
 pub struct RaftPeerProtocol<S, L, M>
 where
     S: Stream<Item = PeerMessage, Error = Error>
@@ -88,14 +189,13 @@ where
         for timeout in self.handler.timeouts.iter() {
             match timeout {
                 &ConsensusTimeout::Heartbeat(id) => {
-                    let mut timer =
-                        tokio::timer::Delay::new(Instant::now() + Duration::from_millis(300));
+                    let mut timer = Delay::new(Instant::now() + Duration::from_millis(300));
                     // timer is definitely not ready yet, but we need notification aobut it
                     //timer.poll().unwrap();
                     self.heartbeat_timers.insert(id, timer);
                 }
                 &ConsensusTimeout::Election => {
-                    let mut timer = tokio::timer::Delay::new(
+                    let mut timer = Delay::new(
                         Instant::now() + Duration::from_millis(self.rng.gen_range(1000, 2000)),
                     );
                     self.election_timer = Some(timer);
