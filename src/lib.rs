@@ -52,10 +52,6 @@ pub struct Connections(Arc<Mutex<HashMap<ServerId, Option<oneshot::Sender<()>>>>
 
 #[cfg(test)]
 mod tests {
-    extern crate tokio_executor;
-    extern crate tokio_reactor;
-    extern crate tokio_timer;
-
     extern crate slog_async;
     extern crate slog_term;
     use std::collections::HashMap;
@@ -77,7 +73,7 @@ mod tests {
     use raft_consensus::message::{ClientResponse, ConsensusTimeout, PeerMessage};
     use raft_consensus::persistent_log::mem::MemLog;
     use raft_consensus::state_machine::null::NullStateMachine;
-    use tokio::executor::current_thread;
+    use tokio::runtime::current_thread::Runtime;
     use raft::{RaftPeerProtocol, RaftStart};
     use tcp::*;
     use handshake::HelloHandshake;
@@ -91,15 +87,14 @@ mod tests {
         nodes.insert(2.into(), "127.0.0.1:9992".parse().unwrap());
         nodes.insert(3.into(), "127.0.0.1:9993".parse().unwrap());
         //        nodes.insert(4.into(), "127.0.0.1:9994".parse().unwrap());
+
         let mut threads = Vec::new();
         // Set logging
         let decorator = slog_term::TermDecorator::new().build();
         let drain = slog_term::FullFormat::new(decorator).build().fuse();
-        let filter = slog::LevelFilter::new(drain, slog::Level::Debug).fuse();
+        let filter = slog::LevelFilter::new(drain, slog::Level::Trace).fuse();
         let drain = slog_async::Async::new(filter).build().fuse();
         let rlog = slog::Logger::root(drain, o!("program"=>"test"));
-        // this lets root logger live as long as it needs
-        //let _guard = slog_scope::set_global_logger(rlog.clone());
 
         for (id, addr) in nodes.clone().into_iter() {
             let nodes = nodes.clone();
@@ -132,8 +127,8 @@ mod tests {
                     let conns = Connections(Arc::new(Mutex::new(HashMap::new())));
 
                     // Prepare peer protocol handler
-                    let (tx, rx) = unbounded();
-                    let protocol = RaftPeerProtocol::new(rx, id, peers.clone(), raft_log, sm);
+                    let (protocol, tx) =
+                        RaftPeerProtocol::new(id, peers.clone(), raft_log, sm, log.clone());
 
                     // select protocol handshake type
                     let handshake = HelloHandshake::new(id);
@@ -142,80 +137,56 @@ mod tests {
                     let codec = RaftCodec;
 
                     let server = empty::<(), Error>();
-                    let mut enter = tokio_executor::enter().expect("Enter");
-                    let reactor = tokio_reactor::Reactor::new().expect("reactor");
 
-                    let handle = reactor.handle();
-                    let timer = tokio_timer::timer::Timer::new(reactor);
-                    let thandle = timer.handle();
+                    // Create the runtime
+                    let mut runtime = Runtime::new().expect("creating runtime");
 
-                    let mut exec = current_thread::CurrentThread::new_with_park(timer);
+                    // Spawn protocol actor
+                    runtime.spawn(protocol.map_err(move |e| println!("Protocol error: {:?}", e)));
 
-                    tokio_reactor::with_default(&handle, &mut enter, move |e| {
-                        tokio_timer::with_default(&thandle, e, move |e| {
-                            // Spawn protocol actor
-                            exec.spawn(
-                                protocol.map_err(move |e| println!("Protocol error: {:?}", e)),
-                            );
+                    // spawn TCP server
+                    let mut srv_handshake = handshake.clone();
+                    srv_handshake.set_is_client(false);
+                    let server = TcpServer::new(
+                        id,
+                        selfad,
+                        conns.clone(),
+                        tx.clone(),
+                        codec.clone(),
+                        srv_handshake,
+                    ).into_future();
 
-                            // spawn TCP server
-                            let mut srv_handshake = handshake.clone();
-                            srv_handshake.set_is_client(false);
-                            let server = TcpServer::new(
-                                id,
-                                selfad,
-                                conns.clone(),
-                                tx.clone(),
-                                codec.clone(),
-                                srv_handshake,
-                                log.clone(),
-                            ).into_future();
+                    let elog = log.clone();
+                    runtime.spawn(server.map_err(move |e| error!(elog, "SERVER ERROR {:?}", e)));
 
-                            exec.spawn(server.map_err(move |e| println!("SERVER ERROR {:?}", e)));
+                    // spawn clients
+                    let remotes = nodes
+                        .iter()
+                        .filter(|&(iid, addr)| if *iid != id { true } else { false })
+                        .map(|(_, addr)| *addr)
+                        .collect::<Vec<_>>();
+                    for addr in remotes {
+                        warn!(log, "connecting to {:?}", addr);
+                        let conn = TcpClient::new(addr, Duration::from_millis(300));
 
-                            let remotes = nodes
-                                .iter()
-                                .filter(|&(iid, addr)| if *iid != id { true } else { false })
-                                .map(|(_, addr)| *addr)
-                                .collect::<Vec<_>>();
-                            for addr in remotes {
-                                warn!(log, "connecting to {:?}", addr);
-                                let conn = TcpClient::new(addr, Duration::from_millis(300));
+                        let conns = conns.clone();
+                        let tx = tx.clone();
+                        let mut client_handshake = handshake.clone();
+                        client_handshake.set_is_client(true);
+                        let codec = codec.clone();
+                        let client_future = conn.into_future().and_then(move |stream| {
+                            let mut start =
+                                RaftStart::new(id, conns, tx, stream, codec, client_handshake);
+                            start.set_is_client(true);
+                            start
+                        });
+                        runtime.spawn(
+                            client_future.map_err(move |e| println!("CLIENT ERROR {:?}", e)),
+                        );
+                    }
 
-                                let conns = conns.clone();
-                                let tx = tx.clone();
-                                let mut client_handshake = handshake.clone();
-                                client_handshake.set_is_client(true);
-                                let codec = codec.clone();
-                                let client_future = conn.into_future().and_then(move |stream| {
-                                    let mut start = RaftStart::new(
-                                        id,
-                                        conns,
-                                        tx,
-                                        stream,
-                                        codec,
-                                        client_handshake,
-                                    );
-                                    start.set_is_client(true);
-                                    start
-                                });
-                                exec.spawn(
-                                    Delay::new(Instant::now() + Duration::from_millis(300))
-                                        .then(|_| Ok(()))
-                                        .and_then(|_| {
-                                            client_future
-                                                .map_err(move |e| println!("CLIENT ERROR {:?}", e))
-                                        }),
-                                );
-                            }
-
-                            exec.enter(e)
-                                .run_timeout(Duration::from_secs(30))
-                                .unwrap_or_else(|e| println!("loop done with err {:?}", e))
-                        })
-                    });
-
-                    println!("DONE");
+                    let test_timeout = Delay::new(Instant::now() + Duration::from_secs(30));
+                    runtime.block_on(test_timeout).expect("runtime");
                 })
                 .unwrap();
             threads.push(th);
