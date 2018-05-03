@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use std::collections::HashMap;
 
 use futures::{Async, Future, Poll, Sink, Stream, future::Either,
-              sync::mpsc::{UnboundedReceiver, UnboundedSender}, sync::oneshot};
+              sync::mpsc::{unbounded, UnboundedReceiver, UnboundedSender}, sync::oneshot};
 
 use raft_consensus::{ClientId, Consensus, ConsensusHandler, Log, ServerId, StateMachine,
                      handler::CollectHandler,
@@ -14,6 +14,8 @@ use tokio_io::{AsyncRead, AsyncWrite, codec::{Decoder, Encoder, Framed}};
 use tokio::prelude::*;
 use tokio::prelude::future::*;
 
+use slog::{Drain, Logger};
+use slog_stdlog::StdLog;
 use rand::Rng;
 use error::Error;
 use handshake::{Handshake, HandshakeExt};
@@ -112,6 +114,8 @@ where
         Box::new(fut.then(|_| Ok(())))
     }
 }
+
+/// Implements fowarding peer messages to consensus, maintaining correct state changes and timeouts
 pub struct RaftPeerProtocol<S, L, M>
 where
     S: Stream<Item = PeerMessage, Error = Error>
@@ -121,13 +125,15 @@ where
     M: StateMachine,
 {
     id: ServerId,
-    new_conns: UnboundedReceiver<(ServerId, S)>,
+    new_conns_tx: UnboundedSender<(ServerId, S)>,
+    new_conns_rx: UnboundedReceiver<(ServerId, S)>,
     handler: CollectHandler,
     consensus: Consensus<L, M>,
     conns: HashMap<ServerId, S>,
     heartbeat_timers: HashMap<ServerId, Delay>,
     election_timer: Option<Delay>,
     rng: ::rand::ThreadRng,
+    logger: Logger,
 }
 
 impl<S, L, M> RaftPeerProtocol<S, L, M>
@@ -138,34 +144,41 @@ where
     L: Log,
     M: StateMachine,
 {
-    pub fn new(
-        new_conns: UnboundedReceiver<(ServerId, S)>,
+    pub fn new<Log: Into<Option<Logger>>>(
+        //new_conns: UnboundedReceiver<(ServerId, S)>,
         id: ServerId,
         peers: Vec<ServerId>,
         log: L,
         sm: M,
-    ) -> Self {
+        logger: Log,
+    ) -> (Self, UnboundedSender<(ServerId, S)>) {
         let mut handler = CollectHandler::new();
         let mut consensus = Consensus::new(id.clone(), peers, log, sm).unwrap();
         consensus.init(&mut handler);
+        let logger = logger.into().unwrap_or(Logger::root(StdLog.fuse(), o!()));
+        let logger = logger.new(o!("id" => id.to_string()));
 
-        Self {
+        let (new_conns_tx, new_conns_rx) = unbounded();
+        let s = Self {
             id,
-            new_conns,
+            new_conns_tx: new_conns_tx.clone(),
+            new_conns_rx,
             handler,
             consensus,
             conns: HashMap::new(),
             heartbeat_timers: HashMap::new(),
             election_timer: None,
             rng: ::rand::thread_rng(),
-        }
+            logger,
+        };
+        (s, new_conns_tx)
     }
 
     fn apply_messages(&mut self) {
         if self.handler.peer_messages.len() > 0 || self.handler.timeouts.len() > 0
             || self.handler.clear_timeouts.len() > 0
         {
-            println!("[{:?}] Applying: {:?}", self.id, self.handler);
+            trace!(self.logger, "applying handler"; "handler" => format!("{:?}", self.handler));
         } else {
             return;
         }
@@ -173,15 +186,18 @@ where
         for (peer, messages) in self.handler.peer_messages.iter() {
             for message in messages {
                 if let Some(conn) = self.conns.get_mut(&peer) {
-                    println!("[{:?}] SEND {:?} to {:?}", self.id, message, peer);
-                    conn.start_send(message.clone())
-                        .map(|_| ())
-                        .unwrap_or_else(|e| println!("Error sending packet to {:?}", peer));
-                    conn.poll_complete().map(|_| ()).unwrap_or_else(|e| {
-                        println!("Error in poll_complete sending packet to {:?}", peer)
-                    });
+                    trace!(self.logger, "send peer message"; "message"=>format!("{:?}", message), "remote"=>peer.to_string());
+                    let elog = self.logger.clone();
+                    conn.start_send(message.clone()).map(|_| ()).unwrap_or_else(
+                        |e| warn!(elog, "could not start packet send"; "remote"=>peer.to_string(), "error"=>e.to_string()),
+                    );
+
+                    let elog = self.logger.clone();
+                    conn.poll_complete().map(|_| ()).unwrap_or_else(
+                        |e| warn!(elog, "could not complete packet send"; "remote"=>peer.to_string(), "error"=>e.to_string()),
+                    );
                 } else {
-                    // TODO print error
+                    warn!(self.logger, "connection entry not found"; "remote"=>peer.to_string());
                 }
             }
         }
@@ -190,8 +206,8 @@ where
             match timeout {
                 &ConsensusTimeout::Heartbeat(id) => {
                     let mut timer = Delay::new(Instant::now() + Duration::from_millis(300));
-                    // timer is definitely not ready yet, but we need notification aobut it
-                    //timer.poll().unwrap();
+                    // timer is definitely not ready yet, but we want a notification about it
+                    timer.poll().unwrap();
                     self.heartbeat_timers.insert(id, timer);
                 }
                 &ConsensusTimeout::Election => {
@@ -221,7 +237,7 @@ where
                 }
             };
         }
-        println!("[{:?}]: STATE {:?}", self.id, self.consensus.get_state());
+        trace!(self.logger, "consensus state after apply"; "state"=>format!("{:?}", self.consensus.get_state()));
         self.handler.clear();
     }
 }
@@ -235,24 +251,24 @@ where
     M: StateMachine,
 {
     type Item = ();
-    type Error = ();
+    type Error = Error;
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         self.apply_messages();
         // First of all - check if we have any new connections in queue
         loop {
-            match self.new_conns.poll() {
+            match self.new_conns_rx.poll() {
                 Ok(Async::NotReady) => break,
                 Ok(Async::Ready(Some((id, conn)))) => {
-                    println!("[{:?}] GOT CONN from {:?}", self.id, id);
+                    debug!(self.logger, "peer connected"; "id"=>id.to_string());
                     self.conns.insert(id, conn);
                 }
                 Ok(Async::Ready(None)) => {
                     // all senders are closed: finish the future
+                    debug!(self.logger, "connection channel closed, exiting");
                     return Ok(Async::Ready(()));
                 }
-                Err(e) => {
-                    // TODO logging
-                    println!("Error polling connections stream: {:?}", e);
+                Err(()) => {
+                    debug!(self.logger, "error polling for new connections"); // error is () here
                     break;
                 }
             }
@@ -263,50 +279,50 @@ where
 
         let mut remove = Vec::new();
         for id in keys.into_iter() {
+            let logger = self.logger.new(o!("peer" => id.to_string()));
             let mut ready;
             loop {
+                // new block here works around self.conns borrowing
                 {
                     let conn = self.conns.get_mut(&id).unwrap();
                     match conn.poll() {
                         Ok(Async::Ready(None)) => {
-                            //                   debug!(log, "CONN ENDED"; "remote" => id.into());
-                            println!("[{:?}] CONN ENDED {:?}", self.id, id);
-                            //remove.push(id)
-                            // TODO what if stream ends?
-                            //unimplemented!();
+                            debug!(logger, "connection closed");
+                            remove.push(id);
                             break;
                         }
                         Ok(Async::Ready(Some(message))) => {
-                            // TODO: trace!
-                            println!("[{:?}] RECV: {:?}", self.id, message);
-                            self.consensus
-                                .apply_peer_message(&mut self.handler, id.clone(), message)
-                                .unwrap(); // TODO error
+                            trace!(logger, "got peer message"; "message"=>format!("{:?}",message));
+                            if let Err(e) = self.consensus.apply_peer_message(
+                                &mut self.handler,
+                                id.clone(),
+                                message,
+                            ) {
+                                warn!(logger, "unexpected consensus error"; "error" => e.to_string());
+                                return Err(Error::Consensus(e));
+                            }
                             ready = true;
                         }
                         Ok(Async::NotReady) => {
-                            //
-                            //println!("[{:?}] NOT READY {:?}", self.id, id);
+                            //trace!(self.logger, "not ready"); // this is too much even for trace
                             break;
                         }
-                        Err(_e) => {
-                            // TODO: warn
-                            println!("resetting connection from {:?} due to error: {:?}", id, _e);
-                            // FIXME start reconnect future
-                            // FIXME remove conn from the list
+                        Err(e) => {
+                            debug!(self.logger, "error in connection, resetting"; "error" => e.to_string());
                             remove.push(id);
                             break;
                         }
                     }
                 }
+
                 if ready {
+                    // FIXME start reconnect future
                     self.apply_messages();
                 }
             }
         }
 
         for id in remove.into_iter() {
-            println!("[{:?}] removing {:?}", self.id, id);
             self.conns.remove(&id);
         }
 
