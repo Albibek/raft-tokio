@@ -6,19 +6,15 @@ use tokio::prelude::*;
 use tokio::prelude::future::*;
 use tokio::timer::Delay;
 use Connections;
-use codec::RaftCodec;
-use handshake::*;
 use tokio_io::codec::{Decoder, Encoder, Framed};
 
 use raft_consensus::message::*;
-use slog::{Drain, Logger};
-use slog_stdlog;
-use futures::sync::{oneshot, mpsc::UnboundedSender};
+use futures::sync::mpsc::UnboundedSender;
 use error::Error;
 
 use raft::RaftStart;
 use raft_consensus::ServerId;
-use handshake::{Handshake, HandshakeExt};
+use handshake::Handshake;
 use std::marker::PhantomData;
 
 /// TCP client that is reconnecting forever until success
@@ -61,6 +57,8 @@ impl IntoFuture for TcpClient {
     }
 }
 
+// TODO example (take from tests)
+
 /// TcpServer works all the time raft exists, is responsible for keeping all connections
 /// to all nodes alive and in a single unique instance
 pub struct TcpServer<C, H> {
@@ -68,25 +66,19 @@ pub struct TcpServer<C, H> {
     listen: SocketAddr,
     peers: Connections,
     tx: UnboundedSender<(ServerId, Framed<TcpStream, C>)>,
-    log: Logger,
     codec: C,
     handshake: H,
 }
 
 impl<C, H> TcpServer<C, H> {
-    pub fn new<L: Into<Option<Logger>>>(
+    pub fn new(
         id: ServerId,
         listen: SocketAddr,
         conns: Connections,
         tx: UnboundedSender<(ServerId, Framed<TcpStream, C>)>,
         codec: C,
         handshake: H,
-        logger: L,
     ) -> Self {
-        let logger = logger
-            .into()
-            .unwrap_or(Logger::root(slog_stdlog::StdLog.fuse(), o!()));
-        let logger = logger.new(o!("id" => id.to_string()));
         Self {
             id,
             listen,
@@ -94,7 +86,6 @@ impl<C, H> TcpServer<C, H> {
             tx,
             codec,
             handshake,
-            log: logger,
         }
     }
 }
@@ -120,14 +111,12 @@ where
             tx,
             codec,
             handshake,
-            log,
         } = self;
         let listener = TcpListener::bind(&listen);
         let listener = match listener {
             Ok(i) => i,
             Err(e) => return Box::new(failed(Error::Io(e))),
         };
-        let log = log.new(o!("id" => selfid.to_string()));
         let fut = listener
             .incoming()
             .map_err(Error::Io)
@@ -141,7 +130,10 @@ where
                     handshake.clone(),
                 );
                 start.set_is_client(false);
-                start.into_future().then(|_| Ok(())) // this avoids server exit on connection errors
+                start.into_future()
+                    // this avoids server exit on connection-level errors
+                    // TODO: probably add logger to log RaftStart issues from here
+                    .then(|_| Ok(()))
             });
         Box::new(fut)
     }
