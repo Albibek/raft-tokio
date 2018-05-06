@@ -1,7 +1,6 @@
 use tokio_io::codec::{Decoder, Encoder};
 use bytes::BytesMut;
 
-use raft_consensus::ServerId;
 use raft_consensus::message::*;
 use bytes::{Buf, BufMut, IntoBuf};
 use rmp_serde::decode::from_read;

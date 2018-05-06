@@ -4,22 +4,33 @@ use tokio_io::codec::{Decoder, Encoder};
 use bytes::BytesMut;
 
 use raft_consensus::ServerId;
-use raft_consensus::message::*;
 use bytes::{Buf, BufMut, IntoBuf};
 use rmp_serde::decode::from_read;
 use rmp_serde::encode::write;
 
 use error::Error;
 
+/// This is a trait useful for types that want to prepend stream's main flow
+/// with some initial exchange
 pub trait Handshake<S>
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
-    type Future: Future<Item = (ServerId, S), Error = Error> + Send + 'static;
-    /// Supposed to return future, should be implemented like into_future
+    type Item;
+    type Future: Future<Item = (Self::Item, S), Error = Error> + Send + 'static;
+
+    /// This is very likely to be implemented in the same way as `into_future`
+    /// The difference is that it gets a stream as input and must return the
+    /// same stream when resolved
     fn from_stream(self, stream: S) -> Self::Future;
+
+    /// An optional convenience method allowing to implement both side handshake in one type
+    /// Intended to helps determining if handshake is working on client or server currently
+    fn set_is_client(&mut self, bool) {}
 }
 
+/// This traits adds with_handshake method to `Stream` allowing to prepend it
+/// with specified handshake
 pub trait HandshakeExt<S>
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
@@ -44,7 +55,7 @@ where
 }
 
 //TODO add list of allowed serverid-s
-/// A simple hello-ehlo handshake. ServerId is sent in both directions.
+/// A simple hello-ehlo handshake. Only ServerId of each side is sent in both directions.
 /// S is a connection being worked on. It can be any async read/write.
 /// The most useful cases, of course are TCP or UDP connection probably wrapped in TLS or any
 /// other wrapping required. Please note that in case of TCP, connection must be established and
@@ -57,9 +68,6 @@ pub struct HelloHandshake {
 
 impl HelloHandshake {
     /// Set a direction of handshake to select client or server-side
-    pub fn set_is_client(&mut self, is_client: bool) {
-        self.is_client = is_client;
-    }
 
     pub fn new(self_id: ServerId) -> Self {
         Self {
@@ -73,21 +81,22 @@ impl<S> Handshake<S> for HelloHandshake
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
-    type Future = Box<Future<Item = (ServerId, S), Error = Error> + Send>;
+    type Item = ServerId;
+    type Future = Box<Future<Item = (Self::Item, S), Error = Error> + Send>;
     fn from_stream(self, stream: S) -> Self::Future {
         let Self { self_id, is_client } = self;
-        let framed = stream.framed(HelloHandshakeCodec(self_id));
+        let framed = stream.framed(HelloHandshakeCodec);
         if is_client {
             let future = framed.send(HelloHandshakeMessage::Hello(self_id)).and_then(
                 move |stream| {
                     stream
                         .into_future()
                         .map_err(|(e, _)| e) // second error is send error, we don't need it
-                        .and_then(move |(id, stream)| {
-                            if let Some(HelloHandshakeMessage::Ehlo(id)) = id {
+                        .and_then(move |(message, stream)| {
+                            if let Some(HelloHandshakeMessage::Ehlo(id)) = message {
                                 Either::A(ok((id, stream.into_inner())))
                             } else {
-                                Either::B(failed(Error::Handshake))
+                                Either::B(failed(Error::ClientHandshake))
                             }
                         })
                 },
@@ -99,7 +108,7 @@ where
                     let id = if let HelloHandshakeMessage::Hello(id) = maybe_id.unwrap() {
                         id
                     } else {
-                        return Either::A(failed(Error::Handshake));
+                        return Either::A(failed(Error::ServerHandshake));
                     };
 
                     Either::B(
@@ -112,6 +121,10 @@ where
             Box::new(future)
         }
     }
+
+    fn set_is_client(&mut self, is_client: bool) {
+        self.is_client = is_client;
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -120,7 +133,7 @@ pub enum HelloHandshakeMessage {
     Ehlo(ServerId),
 }
 
-pub struct HelloHandshakeCodec(pub ServerId);
+pub struct HelloHandshakeCodec;
 
 impl Decoder for HelloHandshakeCodec {
     type Item = HelloHandshakeMessage;

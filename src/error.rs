@@ -8,22 +8,25 @@ use rmp_serde::encode::Error as EncodeError;
 #[fail(display = "Raft error")]
 #[derive(Fail, Debug)]
 pub enum Error {
-    #[fail(display = "Consensus caused an error")]
+    #[fail(display = "consensus error: {:?}", _0)]
     Consensus(#[cause] ConsensusError),
     #[fail(display = "I/O error")]
     Io(#[cause] io::Error),
-    #[fail(display = "Decoding error")]
+    #[fail(display = "decoding error")]
     Decoding(#[cause] DecodeError),
-    #[fail(display = "Encoding error")]
+    #[fail(display = "encoding error")]
     Encoding(#[cause] EncodeError),
 
-    #[fail(display = "Handshake failed")]
-    Handshake,
-    #[fail(display = "Sending connection to protocol handler")]
+    #[fail(display = "client-side handshake failed")]
+    ClientHandshake,
+    #[fail(display = "server-side handshake failed")]
+    ServerHandshake,
+
+    #[fail(display = "sending connection to protocol handler")]
     SendConnection,
-    #[fail(display = "Connection with {:?} was removed because higher priority connection already exist", _0)]
+    #[fail(display = "connection with {:?} was removed because higher priority connection already exist", _0)]
     DuplicateConnection(ServerId),
-    #[fail(display = "Third party error: {:?}", _0)]
+    #[fail(display = "third party error: {:?}", _0)]
     Other(Option<String>),
 }
 

@@ -1,13 +1,10 @@
-use std::io;
-use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 
 use futures::{Async, Future, Poll, Sink, Stream, future::Either,
-              sync::mpsc::{unbounded, UnboundedReceiver, UnboundedSender}, sync::oneshot};
+              sync::mpsc::{unbounded, UnboundedReceiver, UnboundedSender}};
 
-use raft_consensus::{ClientId, Consensus, ConsensusHandler, Log, ServerId, StateMachine,
-                     handler::CollectHandler,
+use raft_consensus::{ClientId, Consensus, Log, ServerId, StateMachine, handler::CollectHandler,
                      message::{ClientResponse, ConsensusTimeout, PeerMessage}};
 use tokio::timer::Delay;
 use tokio_io::{AsyncRead, AsyncWrite, codec::{Decoder, Encoder, Framed}};
@@ -16,7 +13,7 @@ use tokio::prelude::future::*;
 
 use slog::{Drain, Logger};
 use slog_stdlog::StdLog;
-use rand::Rng;
+use rand::{OsRng, Rng};
 use error::Error;
 use handshake::{Handshake, HandshakeExt};
 
@@ -71,7 +68,7 @@ where
         + Decoder<Item = PeerMessage, Error = Error>
         + Send
         + 'static,
-    H: Handshake<S>,
+    H: Handshake<S, Item = ServerId> + Send + 'static,
 {
     type Item = ();
     type Error = Error;
@@ -91,27 +88,29 @@ where
             .with_handshake(handshake)
             .and_then(move |(id, stream)| {
                 let mut new = false;
-                {
-                    let mut peers = peers.0.lock().unwrap();
-                    peers.entry(id).or_insert_with(|| {
-                        new = true;
-                        let (tx, rx) = oneshot::channel();
-                        Some(tx)
-                    });
-                }
-                let is_winner = if is_client {
+                let mut peers = peers.0.lock().unwrap();
+                peers.entry(id).or_insert_with(|| {
+                    new = true;
+                    is_client
+                });
+                let winner = if is_client {
                     self_id > id
                 } else {
                     id > self_id
                 };
-                if !new && is_winner {
+                if !new && !winner {
+                    //println!("DUPDUP: {:?} < {:?}", self_id, id);
                     Either::A(failed(Error::DuplicateConnection(id)))
                 } else {
                     let stream = stream.framed(codec);
-                    Either::B(tx.send((id, stream)).map_err(|_| Error::SendConnection))
+                    Either::B(
+                        tx.send((id, stream))
+                            .map_err(|_| Error::SendConnection)
+                            .map(|_| ()),
+                    )
                 }
             });
-        Box::new(fut.then(|_| Ok(())))
+        Box::new(fut)
     }
 }
 
@@ -124,15 +123,14 @@ where
     L: Log,
     M: StateMachine,
 {
-    id: ServerId,
-    new_conns_tx: UnboundedSender<(ServerId, S)>,
     new_conns_rx: UnboundedReceiver<(ServerId, S)>,
+    disconnect: UnboundedSender<ServerId>,
     handler: CollectHandler,
     consensus: Consensus<L, M>,
     conns: HashMap<ServerId, S>,
     heartbeat_timers: HashMap<ServerId, Delay>,
     election_timer: Option<Delay>,
-    rng: ::rand::ThreadRng,
+    rng: OsRng,
     logger: Logger,
 }
 
@@ -144,31 +142,30 @@ where
     L: Log,
     M: StateMachine,
 {
+    /// `log` field is a raft's log and `logger` is slog::Logger for ehmm..., logging
     pub fn new<Log: Into<Option<Logger>>>(
-        //new_conns: UnboundedReceiver<(ServerId, S)>,
         id: ServerId,
         peers: Vec<ServerId>,
         log: L,
         sm: M,
+        disconnect: UnboundedSender<ServerId>,
         logger: Log,
     ) -> (Self, UnboundedSender<(ServerId, S)>) {
         let mut handler = CollectHandler::new();
         let mut consensus = Consensus::new(id.clone(), peers, log, sm).unwrap();
         consensus.init(&mut handler);
         let logger = logger.into().unwrap_or(Logger::root(StdLog.fuse(), o!()));
-        let logger = logger.new(o!("id" => id.to_string()));
 
         let (new_conns_tx, new_conns_rx) = unbounded();
         let s = Self {
-            id,
-            new_conns_tx: new_conns_tx.clone(),
             new_conns_rx,
+            disconnect,
             handler,
             consensus,
             conns: HashMap::new(),
             heartbeat_timers: HashMap::new(),
             election_timer: None,
-            rng: ::rand::thread_rng(),
+            rng: OsRng::new().unwrap(),
             logger,
         };
         (s, new_conns_tx)
@@ -205,6 +202,7 @@ where
         for timeout in self.handler.timeouts.iter() {
             match timeout {
                 &ConsensusTimeout::Heartbeat(id) => {
+                    // TODO customize timer values
                     let mut timer = Delay::new(Instant::now() + Duration::from_millis(300));
                     // timer is definitely not ready yet, but we want a notification about it
                     timer.poll().unwrap();
@@ -223,17 +221,15 @@ where
             match timeout {
                 &ConsensusTimeout::Heartbeat(id) => {
                     if let None = self.heartbeat_timers.remove(&id) {
-                        // TODO: warn
-                        //   println!("hb timer is requested to be removed but it doesn't exit in list");
+                        debug!(self.logger, "request to remove non exsitent heartbeat timer"; "peer"=>id.to_string());
                     };
                 }
                 &ConsensusTimeout::Election => {
                     self.election_timer = None;
 
-                    //if let None = self.election_timer.take() {
-                    //// TODO: warn
-                    //println!("[{:?}] election timer is requested to be removed but it doesn't exist already", self.id);
-                    //};
+                    if let None = self.election_timer.take() {
+                        debug!(self.logger, "request to remove non exsitent election timer");
+                    };
                 }
             };
         }
@@ -254,12 +250,12 @@ where
     type Error = Error;
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         self.apply_messages();
-        // First of all - check if we have any new connections in queue
+        // first of all - check if we have any new connections in queue
         loop {
             match self.new_conns_rx.poll() {
                 Ok(Async::NotReady) => break,
                 Ok(Async::Ready(Some((id, conn)))) => {
-                    debug!(self.logger, "peer connected"; "id"=>id.to_string());
+                    debug!(self.logger, "peer connected"; "peer"=>id.to_string());
                     self.conns.insert(id, conn);
                 }
                 Ok(Async::Ready(None)) => {
@@ -275,7 +271,6 @@ where
         }
 
         let keys = self.conns.keys().cloned().collect::<Vec<ServerId>>();
-        //let log = self.log.new(o!("id" => self.id.into()));
 
         let mut remove = Vec::new();
         for id in keys.into_iter() {
@@ -293,14 +288,10 @@ where
                         }
                         Ok(Async::Ready(Some(message))) => {
                             trace!(logger, "got peer message"; "message"=>format!("{:?}",message));
-                            if let Err(e) = self.consensus.apply_peer_message(
-                                &mut self.handler,
-                                id.clone(),
-                                message,
-                            ) {
-                                warn!(logger, "unexpected consensus error"; "error" => e.to_string());
-                                return Err(Error::Consensus(e));
-                            }
+                            self.consensus
+                                .apply_peer_message(&mut self.handler, id.clone(), message)
+                                .map_err(|e| Error::Consensus(e))?;
+
                             ready = true;
                         }
                         Ok(Async::NotReady) => {
@@ -316,7 +307,6 @@ where
                 }
 
                 if ready {
-                    // FIXME start reconnect future
                     self.apply_messages();
                 }
             }
@@ -324,47 +314,53 @@ where
 
         for id in remove.into_iter() {
             self.conns.remove(&id);
+            // unbounded channel should not return errors
+            self.disconnect.start_send(id).unwrap();
+            self.disconnect.poll_complete().unwrap();
         }
 
         // And at last, poll all timers. Notice that timers that maybe fired "at the same time"
         // as packet came, are already clear/reset
-        let ready = {
+        let poll = {
             if let Some(ref mut timer) = self.election_timer {
-                match timer.poll() {
-                    Ok(Async::Ready(())) => true,
-                    Ok(Async::NotReady) => false,
-                    // TODO: process err
-                    Err(e) => unimplemented!(),
-                }
+                timer.poll()
             } else {
-                false
+                Ok(Async::NotReady)
             }
         };
+        match poll {
+            Ok(Async::Ready(())) => {
+                trace!(self.logger, "election timeout");
+                self.consensus
+                    .election_timeout(&mut self.handler)
+                    .map_err(|e| Error::Consensus(e))?;
 
-        if ready {
-            println!("[{:?}] ELECTION TIMEOUT", self.id);
-            // FIXME call election_timeout
-            self.consensus
-                .election_timeout(&mut self.handler)
-                .unwrap_or_else(|e| {
-                    println!("error in election timeout: {:?}", e);
-                });
-
-            //self.election_timer = None;
-
-            self.apply_messages();
+                self.apply_messages();
+            }
+            Ok(Async::NotReady) => (),
+            Err(e) => {
+                warn!(self.logger, "unexpected timer error"; "error" => e.to_string(), "timer"=>"election");
+                // try to recreate timer
+                let mut timer = Delay::new(
+                    Instant::now() + Duration::from_millis(self.rng.gen_range(1000, 2000)),
+                );
+                self.election_timer = Some(timer);
+            }
         }
 
         let mut ids = Vec::new();
         for (id, timer) in self.heartbeat_timers.iter_mut() {
             match timer.poll() {
                 Ok(Async::Ready(())) => {
-                    println!("[{:?}] HB TIMEOUT FOR {:?}", self.id, id);
+                    trace!(self.logger, "heartbeat timeout"; "peer"=>id.to_string());
                     ids.push(id.clone());
                 }
                 Ok(Async::NotReady) => (),
-                // TODO: process err
-                Err(e) => unimplemented!(),
+                Err(e) => {
+                    warn!(self.logger, "unexpected timer error"; "error" => e.to_string(), "timer"=>"heartbeat", "peer"=>id.to_string());
+                    // recreate timer
+                    *timer = Delay::new(Instant::now() + Duration::from_millis(300));
+                }
             };
         }
         for id in ids.into_iter() {
@@ -373,9 +369,9 @@ where
                 .map(|msg| {
                     self.handler.peer_messages.insert(id, vec![msg.into()]);
                 })
-                .unwrap_or_else(|e| {
-                    println!("[{:?}] error in consensus: {:?}", self.id, e);
-                });
+                .map_err(|e| Error::Consensus(e))
+                .unwrap_or_else(|_| error!(self.logger, "FUUU3"));
+            //.map_err(|e| Error::Consensus(e))?;
             self.apply_messages();
         }
         Ok(Async::NotReady)
@@ -384,23 +380,5 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::time;
-    use tokio;
-    use tokio::prelude::future;
-
-    // //#[test]
-    //fn test_timer() {
-    //tokio::run(future::lazy(|| {
-    //let d = SharedDelay::new(time::Instant::now() + time::Duration::from_secs(1));
-    //let mut dd = d.clone();
-    //tokio::spawn(d.and_then(move |_| {
-    //println!("DELAY");
-    //dd.reset(time::Instant::now() + time::Duration::from_secs(1));
-    //Ok(())
-    //}));
-    //future::empty()
-    //}));
-    //}
-
+    // TODO tests
 }
