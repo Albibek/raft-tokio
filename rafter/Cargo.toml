@@ -1,0 +1,20 @@
+[package]
+name = "rafter"
+version = "0.1.0"
+authors = ["Albibek <albibek@gmail.com>"]
+
+[dependencies]
+raft-consensus = { version = "^0.2", features = ["use_serde"] }
+tokio = { version = "^0.1" }
+failure_derive="^0.1"
+failure="^0.1"
+futures = "^0.1"
+tokio-io = "^0.1"
+slog = { version = "^2.2", features = ["max_level_trace"] }
+slog-term= "^2.4"
+slog-async= "^2.3"
+raft-tokio = { path = "../" }
+clap = "^2"
+serde="^1"
+serde_derive="^1"
+toml="^0.4"
