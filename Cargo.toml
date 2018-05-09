@@ -23,3 +23,8 @@ slog-stdlog = "^3.0"
 slog = { version = "^2.2", features = ["max_level_trace"] }
 slog-term= "^2.4"
 slog-async= "^2.3"
+
+[workspace]
+members = [
+    "rafter",
+]

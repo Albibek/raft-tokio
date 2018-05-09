@@ -10,7 +10,7 @@ use rmp_serde::encode::Error as EncodeError;
 pub enum Error {
     #[fail(display = "consensus error: {:?}", _0)]
     Consensus(#[cause] ConsensusError),
-    #[fail(display = "I/O error")]
+    #[fail(display = "I/O error: {:?}", _0)]
     Io(#[cause] io::Error),
     #[fail(display = "decoding error")]
     Decoding(#[cause] DecodeError),
@@ -24,7 +24,7 @@ pub enum Error {
 
     #[fail(display = "sending connection to protocol handler")]
     SendConnection,
-    #[fail(display = "connection with {:?} was removed because higher priority connection already exist", _0)]
+    #[fail(display = "connection with {:?} removed by higher priority connection", _0)]
     DuplicateConnection(ServerId),
     #[fail(display = "third party error: {:?}", _0)]
     Other(Option<String>),

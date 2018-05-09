@@ -290,8 +290,10 @@ where
                             trace!(logger, "got peer message"; "message"=>format!("{:?}",message));
                             self.consensus
                                 .apply_peer_message(&mut self.handler, id.clone(), message)
-                                .map_err(|e| Error::Consensus(e))?;
-
+                                .map_err(|e| Error::Consensus(e))
+                                .unwrap_or_else(
+                                    |e| error!(logger, "Consensus error"; "error"=> e.to_string()),
+                                );
                             ready = true;
                         }
                         Ok(Async::NotReady) => {
@@ -333,8 +335,10 @@ where
                 trace!(self.logger, "election timeout");
                 self.consensus
                     .election_timeout(&mut self.handler)
-                    .map_err(|e| Error::Consensus(e))?;
-
+                    .map_err(|e| Error::Consensus(e))
+                    .unwrap_or_else(
+                        |e| error!(self.logger, "Consensus error"; "error"=> e.to_string()),
+                    );
                 self.apply_messages();
             }
             Ok(Async::NotReady) => (),
@@ -370,8 +374,9 @@ where
                     self.handler.peer_messages.insert(id, vec![msg.into()]);
                 })
                 .map_err(|e| Error::Consensus(e))
-                .unwrap_or_else(|_| error!(self.logger, "FUUU3"));
-            //.map_err(|e| Error::Consensus(e))?;
+                .unwrap_or_else(
+                    |e| error!(self.logger, "Consensus error"; "error"=> e.to_string()),
+                );
             self.apply_messages();
         }
         Ok(Async::NotReady)
