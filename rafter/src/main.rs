@@ -18,16 +18,16 @@ extern crate slog_term;
 extern crate raft_tokio;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::fs::File;
 use std::io::Read;
+use std::net::SocketAddr;
 
 use futures::Future;
 use tokio::prelude::future::*;
 
-use tokio::runtime::current_thread::Runtime;
-use slog::Drain;
 use clap::Arg;
+use slog::Drain;
+use tokio::runtime::current_thread::Runtime;
 
 use raft_consensus::ServerId;
 use raft_consensus::persistent_log::mem::MemLog;
@@ -111,9 +111,6 @@ fn main() {
         .get(&id)
         .expect("ID must exist in config")
         .clone();
-    let id: ServerId = id.parse::<u64>()
-        .expect("ID must be unsigned integer")
-        .into();
 
     let nodes: HashMap<ServerId, SocketAddr> = system
         .node
@@ -121,6 +118,7 @@ fn main() {
         .map(|(_, spec)| (spec.id, spec.listen))
         .collect();
 
+    let id = this.id;
     // Set logging
     let decorator = slog_term::TermDecorator::new().build();
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
