@@ -1,21 +1,21 @@
-use std::time::{Duration, Instant};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use futures::{Async, Future, Poll, Sink, Stream, future::Either,
               sync::mpsc::{unbounded, UnboundedReceiver, UnboundedSender}};
 
 use raft_consensus::{ClientId, Consensus, Log, ServerId, StateMachine, handler::CollectHandler,
                      message::{ClientResponse, ConsensusTimeout, PeerMessage}};
+use tokio::prelude::future::*;
+use tokio::prelude::*;
 use tokio::timer::Delay;
 use tokio_io::{AsyncRead, AsyncWrite, codec::{Decoder, Encoder, Framed}};
-use tokio::prelude::*;
-use tokio::prelude::future::*;
 
-use slog::{Drain, Logger};
-use slog_stdlog::StdLog;
-use rand::{OsRng, Rng};
 use error::Error;
 use handshake::{Handshake, HandshakeExt};
+use rand::{OsRng, Rng};
+use slog::{Drain, Logger};
+use slog_stdlog::StdLog;
 
 use Connections;
 
@@ -199,24 +199,6 @@ where
             }
         }
 
-        for timeout in self.handler.timeouts.iter() {
-            match timeout {
-                &ConsensusTimeout::Heartbeat(id) => {
-                    // TODO customize timer values
-                    let mut timer = Delay::new(Instant::now() + Duration::from_millis(300));
-                    // timer is definitely not ready yet, but we want a notification about it
-                    timer.poll().unwrap();
-                    self.heartbeat_timers.insert(id, timer);
-                }
-                &ConsensusTimeout::Election => {
-                    let mut timer = Delay::new(
-                        Instant::now() + Duration::from_millis(self.rng.gen_range(1000, 2000)),
-                    );
-                    self.election_timer = Some(timer);
-                }
-            };
-        }
-
         for timeout in self.handler.clear_timeouts.iter() {
             match timeout {
                 &ConsensusTimeout::Heartbeat(id) => {
@@ -233,6 +215,26 @@ where
                 }
             };
         }
+
+        for timeout in self.handler.timeouts.iter() {
+            match timeout {
+                &ConsensusTimeout::Heartbeat(id) => {
+                    // TODO customize timer values
+                    let mut timer = Delay::new(Instant::now() + Duration::from_millis(300));
+                    // timer is definitely not ready yet, but we want a notification about it
+                    timer.poll().unwrap();
+                    self.heartbeat_timers.insert(id, timer);
+                }
+                &ConsensusTimeout::Election => {
+                    let mut timer = Delay::new(
+                        Instant::now() + Duration::from_millis(self.rng.gen_range(1000, 2000)),
+                    );
+                    timer.poll().unwrap();
+                    self.election_timer = Some(timer);
+                }
+            };
+        }
+
         trace!(self.logger, "consensus state after apply"; "state"=>format!("{:?}", self.consensus.get_state()));
         self.handler.clear();
     }
@@ -348,6 +350,7 @@ where
                 let mut timer = Delay::new(
                     Instant::now() + Duration::from_millis(self.rng.gen_range(1000, 2000)),
                 );
+                timer.poll().unwrap();
                 self.election_timer = Some(timer);
             }
         }
@@ -364,6 +367,7 @@ where
                     warn!(self.logger, "unexpected timer error"; "error" => e.to_string(), "timer"=>"heartbeat", "peer"=>id.to_string());
                     // recreate timer
                     *timer = Delay::new(Instant::now() + Duration::from_millis(300));
+                    timer.poll().unwrap();
                 }
             };
         }
