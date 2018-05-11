@@ -1,9 +1,9 @@
 //! Error type with all possible errors
-use std::io;
 use raft_consensus::ServerId;
 use raft_consensus::error::Error as ConsensusError;
 use rmp_serde::decode::Error as DecodeError;
 use rmp_serde::encode::Error as EncodeError;
+use std::io;
 
 #[fail(display = "Raft error")]
 #[derive(Fail, Debug)]

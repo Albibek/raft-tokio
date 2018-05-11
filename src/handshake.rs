@@ -1,10 +1,10 @@
-use tokio::prelude::*;
-use tokio::prelude::future::*;
-use tokio_io::codec::{Decoder, Encoder};
 use bytes::BytesMut;
+use tokio::prelude::future::*;
+use tokio::prelude::*;
+use tokio_io::codec::{Decoder, Encoder};
 
-use raft_consensus::ServerId;
 use bytes::{Buf, BufMut, IntoBuf};
+use raft_consensus::ServerId;
 use rmp_serde::decode::from_read;
 use rmp_serde::encode::write;
 

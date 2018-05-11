@@ -35,9 +35,9 @@ extern crate tokio;
 extern crate tokio_io;
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::net::SocketAddr;
 
 use futures::{Future, IntoFuture, Sink};
 
@@ -51,15 +51,15 @@ use slog_stdlog::StdLog;
 use raft_consensus::{Log, ServerId, StateMachine};
 
 pub mod codec;
-pub mod tcp;
-pub mod raft;
 pub mod error;
 pub mod handshake;
+pub mod raft;
+pub mod tcp;
 
+use codec::RaftCodec;
+use handshake::{Handshake, HelloHandshake};
 use raft::RaftPeerProtocol;
 use tcp::{TcpServer, TcpWatch};
-use handshake::{Handshake, HelloHandshake};
-use codec::RaftCodec;
 
 #[derive(Debug, Clone)]
 pub struct Connections(Arc<Mutex<HashMap<ServerId, bool>>>);
@@ -115,7 +115,6 @@ pub fn start_raft_tcp<RL: Log + Send + 'static, RM: StateMachine, L: Into<Option
         logger.clone(),
     );
 
-    // FIXME: restart protocol after an error
     spawn(protocol.map_err(
         move |e| error!(elog, "protocol handler stopped with error"; "error"=>e.to_string()),
     ));
@@ -153,18 +152,18 @@ mod tests {
     use std::collections::HashMap;
     use std::thread;
 
-    use slog;
-    use start_raft_tcp;
-    use slog::Drain;
-    use tokio::prelude::*;
-    use tokio::prelude::future::*;
-    use tokio::timer::Delay;
-    use std::time::{Duration, Instant};
-    use std::net::SocketAddr;
     use raft_consensus::ServerId;
     use raft_consensus::persistent_log::mem::MemLog;
     use raft_consensus::state_machine::null::NullStateMachine;
+    use slog;
+    use slog::Drain;
+    use start_raft_tcp;
+    use std::net::SocketAddr;
+    use std::time::{Duration, Instant};
+    use tokio::prelude::future::*;
+    use tokio::prelude::*;
     use tokio::runtime::current_thread::Runtime;
+    use tokio::timer::Delay;
 
     #[test]
     fn temp_test() {

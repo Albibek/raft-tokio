@@ -2,7 +2,7 @@
 listen = "127.0.0.1:9991"
 id = 1
 
-[node.2]
+[node.lol]
 listen = "127.0.0.1:9992"
 id = 2
 
