@@ -1,15 +1,16 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-use std::collections::HashMap;
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::prelude::*;
 use tokio::prelude::future::*;
+use tokio::prelude::*;
+use tokio::spawn;
 use tokio::timer::Delay;
 use tokio_io::codec::{Decoder, Encoder, Framed};
 
-use futures::sync::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::IntoFuture;
+use futures::sync::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 
 use slog::{Drain, Logger};
 use slog_stdlog::StdLog;
@@ -17,9 +18,9 @@ use slog_stdlog::StdLog;
 use raft_consensus::ServerId;
 use raft_consensus::message::*;
 
-use raft::RaftStart;
-use handshake::Handshake;
 use error::Error;
+use handshake::Handshake;
+use raft::RaftStart;
 
 use Connections;
 
@@ -90,9 +91,10 @@ where
         let codec = codec.clone();
 
         // create a separate channel for internal disconnect signals
-        // signal on this channel will mean client connection was failed before getting to
-        // protocol handler, so we don't touch conns
+        // signal on this channel will mean client connection was failed before
+        // handshake touched conns, in which case we don't have to touch it
         let (internal_tx, internal_rx) = unbounded();
+
         let future = disconnect_rx
             .map(|id| Either::A(id))
             .select(internal_rx.map(|id| Either::B(id)))
@@ -136,7 +138,7 @@ where
                 };
 
                 let delay = Delay::new(Instant::now() + delay).map_err(|_| ());
-                delay.and_then(move |_| {
+                let future = delay.and_then(move |_| {
                     client_future.then(move |res| match res {
                         Ok(_) => Either::A(ok(())),
                         Err(e) => {
@@ -156,7 +158,9 @@ where
                             }
                         }
                     })
-                })
+                });
+                spawn(future);
+                Ok(())
             });
         Box::new(future)
     }
