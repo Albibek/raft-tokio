@@ -100,19 +100,18 @@ where
             .select(internal_rx.map(|id| Either::B(id)))
             .for_each(move |dc_id| {
                 let mut is_client = true;
-                let dc_id = match dc_id {
+                let (dc_id, addr) = match dc_id {
                     Either::A(id) => {
+                        let addr = addrs.get(&id).unwrap();
+                        info!(logger.clone(), "reconnecting"; "peer"=>id.to_string(), "remote_addr"=>addr.to_string());
                         let mut conns = conns.0.lock().unwrap();
                         is_client = conns.remove(&id).unwrap_or(true);
-                        id
+                        (id, addr)
                     }
-                    Either::B(id) => id,
+                    Either::B(id) => (id, addrs.get(&id).unwrap()),
                 };
 
-                let addr = addrs.get(&dc_id).unwrap().clone();
-
-                warn!(logger.clone(), "reconnect"; "peer"=>dc_id.to_string(), "remote_addr"=>addr.to_string());
-                let client = TcpClient::new(addr, Duration::from_millis(300));
+                let client = TcpClient::new(*addr, Duration::from_millis(300));
 
                 let conns = conns.clone();
                 let new_conns = new_conns.clone();
@@ -142,20 +141,16 @@ where
                     client_future.then(move |res| match res {
                         Ok(_) => Either::A(ok(())),
                         Err(e) => {
-                            //if let Error::DuplicateConnection(_) = e {
-                            if false {
-                                Either::B(Either::A(ok(())))
+                            if let Error::DuplicateConnection(_) = e {
+                                //Either::B(Either::A(ok(())))
                             } else {
                                 warn!(logger, "client handshake error"; "error"=>e.to_string(), "remote"=>dc_id.to_string());
-                                let delay = Delay::new(
-                                    Instant::now() + Duration::from_millis(1000),
-                                ).map_err(|_| ());
-                                Either::B(Either::B(
-                                    delay.and_then(move |_| {
-                                        internal_tx.send(dc_id).then(|_| Ok(()))
-                                    }),
-                                ))
-                            }
+                            };
+                            let delay = Delay::new(Instant::now() + Duration::from_millis(1000))
+                                .map_err(|_| ());
+                            Either::B(
+                                delay.and_then(move |_| internal_tx.send(dc_id).then(|_| Ok(()))),
+                            )
                         }
                     })
                 });

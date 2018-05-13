@@ -8,13 +8,16 @@ extern crate bytes;
 ///! * Decoding messages from network and passing them to consensus
 ///! * (Obviously) taking messages consensus required to generate and passing them to network
 ///!
-///! # Connection handling.
+///! The main future - `RaftPeerProtocol` is stream and codec independent. Also there are
+///! futures helping to deal with TCP connections.
+///!
+///! # TCP connection handling
 ///! In raft every node is equal to others. So main question here is, in TCP terms, which of nodes
 ///! should be a client and which of them should be a server. To solve this problem we make the
-///! both sides to try to connect and make a last side able to do this win. To work around
-///! total symmetry we add a rule: the connection with bigger ID wins
+///! both sides to try to connect and make a side with bigger ServerId win. This is implemented in
+///! `RaftStart` future and is optional to use
 ///! For achieving such behaviour we do the following:
-///! * we introduce a node-global shared `Connections` structure where all alive connections
+///! * we introduce a shared `Connections` structure where all alive connections
 ///! are accounted
 ///! * we consider an active connection the one that that passed the handshake
 ///! * established connection (no matter what side from) is passed to protocol via channel
@@ -37,7 +40,6 @@ extern crate tokio_io;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use futures::{Future, IntoFuture, Sink};
 
@@ -58,7 +60,7 @@ pub mod tcp;
 
 use codec::RaftCodec;
 use handshake::{Handshake, HelloHandshake};
-use raft::RaftPeerProtocol;
+use raft::{RaftOptions, RaftPeerProtocol};
 use tcp::{TcpServer, TcpWatch};
 
 #[derive(Debug, Clone)]
@@ -93,6 +95,9 @@ pub fn start_raft_tcp<RL: Log + Send + 'static, RM: StateMachine, L: Into<Option
 
     let (disconnect_tx, disconnect_rx) = unbounded();
 
+    let mut options = RaftOptions::default();
+    options.set_logger(logger.clone());
+
     // prepare peer protocol handler
     let (protocol, tx) = RaftPeerProtocol::new(
         id,
@@ -100,7 +105,7 @@ pub fn start_raft_tcp<RL: Log + Send + 'static, RM: StateMachine, L: Into<Option
         raft_log,
         machine,
         disconnect_tx.clone(),
-        logger.clone(),
+        options,
     );
 
     // create watcher
@@ -161,7 +166,6 @@ mod tests {
     use std::net::SocketAddr;
     use std::time::{Duration, Instant};
     use tokio::prelude::future::*;
-    use tokio::prelude::*;
     use tokio::runtime::current_thread::Runtime;
     use tokio::timer::Delay;
 
