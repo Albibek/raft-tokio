@@ -1,3 +1,4 @@
+//! Codecs for encoding/decoding Raft messages
 use bytes::BytesMut;
 use tokio_io::codec::{Decoder, Encoder};
 
@@ -8,6 +9,7 @@ use rmp_serde::encode::write;
 
 use error::Error;
 
+/// A MesssagePack codec for raft messages
 #[derive(Clone, Debug)]
 pub struct RaftCodec;
 

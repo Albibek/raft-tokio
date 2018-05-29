@@ -16,16 +16,24 @@ extern crate bytes;
 ///! should be a client and which of them should be a server. To solve this problem we make the
 ///! both sides to try to connect and make a side with bigger ServerId win. This is implemented in
 ///! `RaftStart` future and is optional to use
-///! For achieving such behaviour we do the following:
-///! * we introduce a shared `Connections` structure where all alive connections
-///! are accounted
-///! * we consider an active connection the one that that passed the handshake
-///! * established connection (no matter what side from) is passed to protocol via channel
+///!
+///! Acheiving these requirements gives us a flexibility about what side the connection is established
+///! from, so we could work around some typical firewall limitations(like DMZ) where there is a hard
+///! limit for connections being established from one segment to another, but there is almost no
+///! rules denying connecting in reverse direction
+// (this is a part about internals not needed in public docs)
+// For achieving such behaviour we do the following:
+// * we introduce a shared `Connections` structure where all alive connections
+// are accounted
+// * we consider an active connection the one that that passed the handshake
+// * established connection (no matter what side from) is passed to protocol via channel
+// * when protocol detects disconnect, it sends the messsage to connection watcher
+// * the watcher is responsible to provide a new connection to protocol
 extern crate failure;
 #[macro_use]
 extern crate failure_derive;
 extern crate futures;
-extern crate raft_consensus;
+pub extern crate raft_consensus;
 extern crate rand;
 extern crate rmp_serde;
 extern crate serde;
@@ -39,7 +47,6 @@ extern crate tokio_io;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 
 use futures::{Future, IntoFuture, Sink};
 
@@ -50,6 +57,7 @@ use tokio::net::TcpStream;
 use slog::{Drain, Logger};
 use slog_stdlog::StdLog;
 
+pub use raft_consensus as consensus;
 use raft_consensus::{Log, ServerId, StateMachine};
 
 pub mod codec;
@@ -61,16 +69,12 @@ pub mod tcp;
 use codec::RaftCodec;
 use handshake::{Handshake, HelloHandshake};
 use raft::{RaftOptions, RaftPeerProtocol};
-use tcp::{TcpServer, TcpWatch};
-
-#[derive(Debug, Clone)]
-pub struct Connections(Arc<Mutex<HashMap<ServerId, bool>>>);
+use tcp::{Connections, TcpServer, TcpWatch};
 
 // TODO: tcp retry timeout
 /// Starts typical Raft with TCP connection and simple handshake
-/// note that `peers` must contain a list of all peers including current node
-/// also note that current runtime is used, which means this function
-/// has to be executed from inside of a running future
+/// note that `peers` must contain a list of all peers including current node.
+/// Requires default tokio runtime to be already running, and may panic otherwise.
 pub fn start_raft_tcp<RL: Log + Send + 'static, RM: StateMachine, L: Into<Option<Logger>>>(
     id: ServerId,
     mut nodes: HashMap<ServerId, SocketAddr>,
@@ -79,7 +83,7 @@ pub fn start_raft_tcp<RL: Log + Send + 'static, RM: StateMachine, L: Into<Option
     logger: L,
 ) {
     let logger = logger.into().unwrap_or(Logger::root(StdLog.fuse(), o!()));
-    let conns = Connections(Arc::new(Mutex::new(HashMap::new())));
+    let conns = Connections::default();
 
     let listen = nodes.remove(&id).unwrap();
     let node_vec = nodes.keys().cloned().collect();
@@ -157,9 +161,9 @@ mod tests {
     use std::collections::HashMap;
     use std::thread;
 
-    use raft_consensus::ServerId;
     use raft_consensus::persistent_log::mem::MemLog;
     use raft_consensus::state_machine::null::NullStateMachine;
+    use raft_consensus::ServerId;
     use slog;
     use slog::Drain;
     use start_raft_tcp;

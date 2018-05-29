@@ -1,15 +1,28 @@
+//! Raft-related types and futures
 use std::collections::HashMap;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use futures::{Async, Future, Poll, Sink, Stream, future::Either,
-              sync::mpsc::{unbounded, UnboundedReceiver, UnboundedSender}};
+use futures::{future::Either,
+              sync::mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
+              Async,
+              Future,
+              Poll,
+              Sink,
+              Stream};
 
-use raft_consensus::{ClientId, Consensus, Log, ServerId, StateMachine, handler::CollectHandler,
-                     message::{ClientResponse, ConsensusTimeout, PeerMessage}};
+use raft_consensus::{handler::CollectHandler,
+                     message::{ClientResponse, ConsensusTimeout, PeerMessage},
+                     ClientId,
+                     Consensus,
+                     Log,
+                     ServerId,
+                     StateMachine};
 use tokio::prelude::future::*;
 use tokio::timer::Delay;
-use tokio_io::{AsyncRead, AsyncWrite, codec::{Decoder, Encoder, Framed}};
+use tokio_io::{codec::{Decoder, Encoder, Framed},
+               AsyncRead,
+               AsyncWrite};
 
 use error::Error;
 use handshake::{Handshake, HandshakeExt};
@@ -19,6 +32,7 @@ use slog_stdlog::StdLog;
 
 use Connections;
 
+/// Basic consensus settings
 #[derive(Debug, Clone)]
 pub struct RaftOptions {
     pub heartbeat_timeout: Duration,

@@ -1,3 +1,4 @@
+//! Some simple initial handshake traits and implementations
 use bytes::BytesMut;
 use tokio::prelude::future::*;
 use tokio::prelude::*;
@@ -12,6 +13,11 @@ use error::Error;
 
 /// This is a trait useful for types that want to prepend stream's main flow
 /// with some initial exchange
+///
+/// S here is supposed to be a connection being worked on. It can be any async read/write.
+/// The most useful cases, of course are TCP or UDP connection probably wrapped in TLS or any
+/// other wrapping required. Please note that in case of TCP, connection must be established and
+/// ready to send packets
 pub trait Handshake<S>
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
@@ -56,10 +62,6 @@ where
 
 //TODO add list of allowed serverid-s
 /// A simple hello-ehlo handshake. Only ServerId of each side is sent in both directions.
-/// S is a connection being worked on. It can be any async read/write.
-/// The most useful cases, of course are TCP or UDP connection probably wrapped in TLS or any
-/// other wrapping required. Please note that in case of TCP, connection must be established and
-/// ready to send packets
 #[derive(Clone, Debug)]
 pub struct HelloHandshake {
     self_id: ServerId,
@@ -127,12 +129,14 @@ where
     }
 }
 
+/// A message for HelloHandshake protocol
 #[derive(Debug, Serialize, Deserialize)]
 pub enum HelloHandshakeMessage {
     Hello(ServerId),
     Ehlo(ServerId),
 }
 
+/// A MesssagePack encoder for handshaking
 pub struct HelloHandshakeCodec;
 
 impl Decoder for HelloHandshakeCodec {

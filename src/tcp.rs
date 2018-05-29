@@ -1,5 +1,7 @@
+//! Types and futures responsible for handling TCP aspects of protocol
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, TcpStream};
@@ -9,21 +11,33 @@ use tokio::spawn;
 use tokio::timer::Delay;
 use tokio_io::codec::{Decoder, Encoder, Framed};
 
-use futures::IntoFuture;
 use futures::sync::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+use futures::IntoFuture;
 
 use slog::{Drain, Logger};
 use slog_stdlog::StdLog;
 
-use raft_consensus::ServerId;
 use raft_consensus::message::*;
+use raft_consensus::ServerId;
 
 use error::Error;
 use handshake::Handshake;
 use raft::RaftStart;
 
-use Connections;
+/// A shared connection pool to ensure client and server-side connections to be mutually exclusive
+#[derive(Debug, Clone)]
+pub struct Connections(pub(crate) Arc<Mutex<HashMap<ServerId, bool>>>);
 
+impl Default for Connections {
+    fn default() -> Self {
+        Connections(Arc::new(Mutex::new(HashMap::new())))
+    }
+}
+
+/// A watcher for client connections
+///
+/// Accounts connections incoming over `disconnect_rx`, re-establishes them, doing a
+/// specified handshake and sends the ones that passed the handshake over new_conns channel
 pub struct TcpWatch<C, H> {
     id: ServerId,
     addrs: HashMap<ServerId, SocketAddr>,
