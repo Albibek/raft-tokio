@@ -4,7 +4,7 @@ version = "0.1.0"
 authors = ["Albibek <albibek@gmail.com>"]
 
 [dependencies]
-raft-consensus = { version = "^0.2", features = ["use_serde"] }
+raft-consensus = { version = "^0.3", features = ["use_serde"] }
 tokio = { version = "^0.1" }
 failure_derive="^0.1"
 failure="^0.1"

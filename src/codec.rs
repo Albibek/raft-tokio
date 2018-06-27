@@ -19,12 +19,12 @@ impl Decoder for RaftCodec {
     type Item = PeerMessage;
     type Error = Error;
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.len() == 0 {
+        if src.is_empty() {
             return Ok(None);
         }
         let message: PeerMessage =
             from_read(src.take().into_buf().reader()).map_err(Error::Decoding)?;
-        Ok(Some(message.into()))
+        Ok(Some(message))
     }
 }
 

@@ -68,6 +68,7 @@ pub mod tcp;
 
 use codec::RaftCodec;
 use handshake::{Handshake, HelloHandshake};
+pub use raft::Notifier;
 use raft::{RaftOptions, RaftPeerProtocol};
 use tcp::{Connections, TcpServer, TcpWatch};
 
@@ -75,14 +76,22 @@ use tcp::{Connections, TcpServer, TcpWatch};
 /// Starts typical Raft with TCP connection and simple handshake
 /// note that `peers` must contain a list of all peers including current node.
 /// Requires default tokio runtime to be already running, and may panic otherwise.
-pub fn start_raft_tcp<RL: Log + Send + 'static, RM: StateMachine, L: Into<Option<Logger>>>(
+pub fn start_raft_tcp<RL, RM, L, N>(
     id: ServerId,
     mut nodes: HashMap<ServerId, SocketAddr>,
     raft_log: RL,
     machine: RM,
+    notifier: N,
     logger: L,
-) {
-    let logger = logger.into().unwrap_or(Logger::root(StdLog.fuse(), o!()));
+) where
+    RL: Log + Send + 'static,
+    RM: StateMachine,
+    L: Into<Option<Logger>>,
+    N: Notifier + Send + 'static,
+{
+    let logger = logger
+        .into()
+        .unwrap_or_else(|| Logger::root(StdLog.fuse(), o!()));
     let conns = Connections::default();
 
     let listen = nodes.remove(&id).unwrap();
@@ -108,6 +117,7 @@ pub fn start_raft_tcp<RL: Log + Send + 'static, RM: StateMachine, L: Into<Option
         node_vec,
         raft_log,
         machine,
+        notifier,
         disconnect_tx.clone(),
         options,
     );
@@ -147,7 +157,7 @@ pub fn start_raft_tcp<RL: Log + Send + 'static, RM: StateMachine, L: Into<Option
         server.map_err(move |e| error!(elog, "server exited with error"; "error"=>e.to_string())),
     );
 
-    for (id, _) in nodes.into_iter() {
+    for (id, _) in nodes {
         // for an initial connection send a disconnect message
         // so watcher could reconnect
         spawn(disconnect_tx.clone().send(id).then(|_| Ok(())));
@@ -205,12 +215,13 @@ mod tests {
 
                     // Create the runtime
                     let mut runtime = Runtime::new().expect("creating runtime");
+                    let notifier = ::raft::DoNotNotify;
 
                     let raft = lazy(|| {
                         if id == ServerId(1) {
-                            start_raft_tcp(id, nodes, raft_log, sm, log);
+                            start_raft_tcp(id, nodes, raft_log, sm, notifier, log);
                         } else {
-                            start_raft_tcp(id, nodes, raft_log, sm, log);
+                            start_raft_tcp(id, nodes, raft_log, sm, notifier, log);
                         }
                         Ok(())
                     });

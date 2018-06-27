@@ -14,8 +14,7 @@ use tokio_io::codec::{Decoder, Encoder, Framed};
 use futures::sync::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::IntoFuture;
 
-use slog::{Drain, Logger};
-use slog_stdlog::StdLog;
+use slog::Logger;
 
 use raft_consensus::message::*;
 use raft_consensus::ServerId;
@@ -50,7 +49,7 @@ pub struct TcpWatch<C, H> {
 }
 
 impl<C, H> TcpWatch<C, H> {
-    pub fn new<L: Into<Option<Logger>>>(
+    pub fn new(
         id: ServerId,
         addrs: HashMap<ServerId, SocketAddr>,
         conns: Connections,
@@ -58,9 +57,8 @@ impl<C, H> TcpWatch<C, H> {
         disconnect_rx: UnboundedReceiver<ServerId>,
         codec: C,
         handshake: H,
-        logger: L,
+        logger: Logger,
     ) -> Self {
-        let logger = logger.into().unwrap_or(Logger::root(StdLog.fuse(), o!()));
         Self {
             id,
             addrs,
@@ -110,19 +108,19 @@ where
         let (internal_tx, internal_rx) = unbounded();
 
         let future = disconnect_rx
-            .map(|id| Either::A(id))
-            .select(internal_rx.map(|id| Either::B(id)))
+            .map(Either::A)
+            .select(internal_rx.map(Either::B))
             .for_each(move |dc_id| {
                 let mut is_client = true;
                 let (dc_id, addr) = match dc_id {
                     Either::A(id) => {
-                        let addr = addrs.get(&id).unwrap();
+                        let addr = &addrs[&id];
                         info!(logger.clone(), "reconnecting"; "peer"=>id.to_string(), "remote_addr"=>addr.to_string());
                         let mut conns = conns.0.lock().unwrap();
                         is_client = conns.remove(&id).unwrap_or(true);
                         (id, addr)
                     }
-                    Either::B(id) => (id, addrs.get(&id).unwrap()),
+                    Either::B(id) => (id, &addrs[&id]),
                 };
 
                 let client = TcpClient::new(*addr, Duration::from_millis(300));

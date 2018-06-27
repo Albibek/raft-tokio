@@ -13,6 +13,7 @@ use futures::{future::Either,
 
 use raft_consensus::{handler::CollectHandler,
                      message::{ClientResponse, ConsensusTimeout, PeerMessage},
+                     state::ConsensusState,
                      ClientId,
                      Consensus,
                      Log,
@@ -150,19 +151,31 @@ where
     }
 }
 
+/// Provides useful information from protocol about state changing
+pub trait Notifier {
+    #[allow(unused_variables)]
+    fn state_changed(&mut self, old: ConsensusState, new: ConsensusState) {}
+}
+
+/// The notification handler ignoring all notifications
+pub struct DoNotNotify;
+impl Notifier for DoNotNotify {}
+
 /// Implements forwarding peer messages to consensus, maintaining correct state changes and timeouts
-pub struct RaftPeerProtocol<S, L, M>
+pub struct RaftPeerProtocol<S, L, M, N>
 where
     S: Stream<Item = PeerMessage, Error = Error>
         + Sink<SinkItem = PeerMessage, SinkError = Error>
         + Send,
     L: Log,
     M: StateMachine,
+    N: Notifier,
 {
     new_conns_rx: UnboundedReceiver<(ServerId, S)>,
     disconnect: UnboundedSender<ServerId>,
     handler: CollectHandler,
     consensus: Consensus<L, M>,
+    notifier: N,
     conns: HashMap<ServerId, S>,
     heartbeat_timers: HashMap<ServerId, Delay>,
     election_timer: Option<Delay>,
@@ -170,24 +183,26 @@ where
     options: RaftOptions,
 }
 
-impl<S, L, M> RaftPeerProtocol<S, L, M>
+impl<S, L, M, N> RaftPeerProtocol<S, L, M, N>
 where
     S: Stream<Item = PeerMessage, Error = Error>
         + Sink<SinkItem = PeerMessage, SinkError = Error>
         + Send,
     L: Log,
     M: StateMachine,
+    N: Notifier,
 {
     pub fn new(
         id: ServerId,
         peers: Vec<ServerId>,
         log: L,
         sm: M,
+        notifier: N,
         disconnect: UnboundedSender<ServerId>,
         options: RaftOptions,
     ) -> (Self, UnboundedSender<(ServerId, S)>) {
         let mut handler = CollectHandler::new();
-        let mut consensus = Consensus::new(id.clone(), peers, log, sm).unwrap();
+        let mut consensus = Consensus::new(id, peers, log, sm).unwrap();
         consensus.init(&mut handler);
 
         let (new_conns_tx, new_conns_rx) = unbounded();
@@ -196,6 +211,7 @@ where
             disconnect,
             handler,
             consensus,
+            notifier,
             conns: HashMap::new(),
             heartbeat_timers: HashMap::new(),
             election_timer: None,
@@ -207,15 +223,15 @@ where
 
     fn apply_messages(&mut self) {
         let logger = self.options.logger.clone();
-        if self.handler.peer_messages.len() > 0 || self.handler.timeouts.len() > 0
-            || self.handler.clear_timeouts.len() > 0
+        if self.handler.peer_messages.is_empty() && self.handler.timeouts.is_empty()
+            && self.handler.clear_timeouts.is_empty()
         {
-            trace!(logger, "applying handler"; "handler" => format!("{:?}", self.handler));
-        } else {
             return;
+        } else {
+            trace!(logger, "applying handler"; "handler" => format!("{:?}", self.handler));
         }
 
-        for (peer, messages) in self.handler.peer_messages.iter() {
+        for (peer, messages) in &self.handler.peer_messages {
             for message in messages {
                 if let Some(conn) = self.conns.get_mut(&peer) {
                     trace!(logger, "send peer message"; "message"=>format!("{:?}", message), "remote"=>peer.to_string());
@@ -234,17 +250,17 @@ where
             }
         }
 
-        for timeout in self.handler.clear_timeouts.iter() {
-            match timeout {
-                &ConsensusTimeout::Heartbeat(id) => {
-                    if let None = self.heartbeat_timers.remove(&id) {
+        for timeout in &self.handler.clear_timeouts {
+            match *timeout {
+                ConsensusTimeout::Heartbeat(id) => {
+                    if self.heartbeat_timers.remove(&id).is_none() {
                         debug!(logger, "request to remove non existent heartbeat timer"; "peer"=>id.to_string());
                     };
                 }
-                &ConsensusTimeout::Election => {
+                ConsensusTimeout::Election => {
                     self.election_timer = None;
 
-                    if let None = self.election_timer.take() {
+                    if self.election_timer.take().is_none() {
                         debug!(logger, "request to remove non existent election timer");
                     };
                 }
@@ -252,13 +268,13 @@ where
         }
 
         let mut election_reset = false;
-        for timeout in self.handler.timeouts.iter() {
-            match timeout {
-                &ConsensusTimeout::Heartbeat(id) => {
+        for timeout in &self.handler.timeouts {
+            match *timeout {
+                ConsensusTimeout::Heartbeat(id) => {
                     let timer = self.new_heartbeat_timer();
                     self.heartbeat_timers.insert(id, timer);
                 }
-                &ConsensusTimeout::Election => {
+                ConsensusTimeout::Election => {
                     election_reset = true;
                 }
             };
@@ -267,7 +283,7 @@ where
             let timer = self.new_election_timer();
             self.election_timer = Some(timer);
         }
-        trace!(logger, "consensus state after apply"; "state"=>format!("{:?}", self.consensus.get_state()));
+        trace!(logger, "apply finished"; "state"=>format!("{:?}", self.handler.state));
         self.handler.clear();
     }
 
@@ -280,9 +296,9 @@ where
 
     fn new_election_timer(&mut self) -> Delay {
         let start = self.options.election_timeout.start.as_secs() * 1_000_000_000
-            + self.options.election_timeout.start.subsec_nanos() as u64;
+            + u64::from(self.options.election_timeout.start.subsec_nanos());
         let end = self.options.election_timeout.end.as_secs() * 1_000_000_000
-            + self.options.election_timeout.end.subsec_nanos() as u64;
+            + u64::from(self.options.election_timeout.end.subsec_nanos());
         let mut timer = Delay::new(
             Instant::now() + Duration::from_millis(self.rng.gen_range(start, end) / 1_000_000),
         );
@@ -291,17 +307,19 @@ where
     }
 }
 
-impl<S, L, M> Future for RaftPeerProtocol<S, L, M>
+impl<S, L, M, N> Future for RaftPeerProtocol<S, L, M, N>
 where
     S: Stream<Item = PeerMessage, Error = Error>
         + Sink<SinkItem = PeerMessage, SinkError = Error>
         + Send,
     L: Log,
     M: StateMachine,
+    N: Notifier,
 {
     type Item = ();
     type Error = Error;
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let state = self.handler.state.clone();
         self.apply_messages();
         // first of all - check if we have any new connections in queue
         loop {
@@ -326,7 +344,7 @@ where
         let keys = self.conns.keys().cloned().collect::<Vec<ServerId>>();
 
         let mut remove = Vec::new();
-        for id in keys.into_iter() {
+        for id in keys {
             let logger = self.options.logger.new(o!("peer" => id.to_string()));
             let mut ready;
             loop {
@@ -342,8 +360,8 @@ where
                         Ok(Async::Ready(Some(message))) => {
                             trace!(logger, "got peer message"; "message"=>format!("{:?}",message));
                             self.consensus
-                                .apply_peer_message(&mut self.handler, id.clone(), message)
-                                .map_err(|e| Error::Consensus(e))
+                                .apply_peer_message(&mut self.handler, id, message)
+                                .map_err(Error::Consensus)
                                 .unwrap_or_else(
                                     |e| error!(logger, "Consensus error"; "error"=> e.to_string()),
                                 );
@@ -367,7 +385,7 @@ where
             }
         }
 
-        for id in remove.into_iter() {
+        for id in remove {
             self.conns.remove(&id);
             // unbounded channel should not return errors
             self.disconnect.start_send(id).unwrap();
@@ -388,7 +406,7 @@ where
                 trace!(self.options.logger, "election timeout");
                 self.consensus
                     .election_timeout(&mut self.handler)
-                    .map_err(|e| Error::Consensus(e))
+                    .map_err(Error::Consensus)
                     .unwrap_or_else(
                         |e| error!(self.options.logger, "Consensus error"; "error"=> e.to_string()),
                     );
@@ -404,21 +422,21 @@ where
 
         let mut timed_out = Vec::new();
         let logger = self.options.logger.clone();
-        for (id, timer) in self.heartbeat_timers.iter_mut() {
+        for (id, timer) in &mut self.heartbeat_timers {
             match timer.poll() {
                 Ok(Async::Ready(())) => {
                     trace!(logger, "heartbeat timeout"; "peer"=>id.to_string());
-                    timed_out.push(Either::A(id.clone()));
+                    timed_out.push(Either::A(*id));
                 }
                 Ok(Async::NotReady) => (),
                 Err(e) => {
                     warn!(self.options.logger, "unexpected timer error"; "error" => e.to_string(), "timer"=>"heartbeat", "peer"=>id.to_string());
-                    timed_out.push(Either::B(id.clone()));
+                    timed_out.push(Either::B(*id));
                 }
             };
         }
 
-        for id in timed_out.into_iter() {
+        for id in timed_out {
             match id {
                 Either::A(id) => {
                     self.consensus
@@ -426,7 +444,7 @@ where
                         .map(|msg| {
                             self.handler.peer_messages.insert(id, vec![msg.into()]);
                         })
-                        .map_err(|e| Error::Consensus(e))
+                        .map_err(Error::Consensus)
                         .unwrap_or_else(
                             |e| error!(self.options.logger, "Consensus error"; "error"=> e.to_string()),
                         );
@@ -437,6 +455,10 @@ where
                     self.heartbeat_timers.insert(id, timer);
                 }
             }
+        }
+        if state != self.handler.state {
+            self.notifier
+                .state_changed(state, self.handler.state.clone());
         }
         Ok(Async::NotReady)
     }

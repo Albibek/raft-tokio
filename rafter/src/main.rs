@@ -22,19 +22,20 @@ use std::fs::File;
 use std::io::Read;
 use std::net::SocketAddr;
 
-use futures::Future;
-use tokio::prelude::future::*;
-
 use clap::Arg;
-use slog::Drain;
+use slog::{Drain, Level, Logger};
+
+use tokio::prelude::future::*;
 use tokio::runtime::current_thread::Runtime;
 
-use raft_consensus::ServerId;
 use raft_consensus::persistent_log::mem::MemLog;
+use raft_consensus::state::ConsensusState;
 use raft_consensus::state_machine::null::NullStateMachine;
+use raft_consensus::ServerId;
 
 //use raft_tokio::raft::RaftPeerProtocol;
 use raft_tokio::start_raft_tcp;
+use raft_tokio::Notifier;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
@@ -67,6 +68,20 @@ impl Default for Config {
     }
 }
 
+struct LeaderNotifier(Logger);
+
+impl Notifier for LeaderNotifier {
+    fn state_changed(&mut self, old: ConsensusState, new: ConsensusState) {
+        if old != new {
+            if new == ConsensusState::Leader {
+                warn!(self.0, "leader now")
+            } else if old == ConsensusState::Leader {
+                warn!(self.0, "lost leader")
+            }
+        }
+    }
+}
+
 fn main() {
     let app = app_from_crate!()
         .arg(
@@ -82,6 +97,7 @@ fn main() {
             Arg::with_name("verbosity")
                 .short("v")
                 .help("logging level")
+                .default_value("warn")
                 .takes_value(true),
         )
         .arg(
@@ -94,6 +110,10 @@ fn main() {
 
     let config = value_t!(app.value_of("config"), String).expect("config file must be string");
     let id = value_t!(app.value_of("id"), String).expect("ID must be string");
+
+    let verbosity = value_t!(app.value_of("verbosity"), Level).expect("bad verbosity");
+    //let verbosity = Level::from_str(&verbosity).expect("bad verbosity");
+
     let mut file = File::open(&config).expect(&format!("opening config file at {}", &config));
     let mut config_str = String::new();
     file.read_to_string(&mut config_str)
@@ -122,7 +142,7 @@ fn main() {
     // Set logging
     let decorator = slog_term::TermDecorator::new().build();
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
-    let filter = slog::LevelFilter::new(drain, slog::Level::Trace).fuse();
+    let filter = slog::LevelFilter::new(drain, verbosity).fuse();
     let drain = slog_async::Async::new(filter).build().fuse();
     let rlog = slog::Logger::root(drain, o!("program"=>"test"));
 
@@ -133,15 +153,16 @@ fn main() {
     // prepare consensus
     let raft_log = MemLog::new();
     let sm = NullStateMachine;
+    let notifier = LeaderNotifier(log.clone());
 
     // Create the runtime
     let mut runtime = Runtime::new().expect("creating runtime");
 
     let raft = lazy(move || {
         if id == ServerId(1) {
-            start_raft_tcp(id, nodes, raft_log, sm, log);
+            start_raft_tcp(id, nodes, raft_log, sm, notifier, log);
         } else {
-            start_raft_tcp(id, nodes, raft_log, sm, log);
+            start_raft_tcp(id, nodes, raft_log, sm, notifier, log);
         }
         Ok::<(), ()>(())
     });
