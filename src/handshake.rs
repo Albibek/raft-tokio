@@ -31,7 +31,7 @@ where
     fn from_stream(self, stream: S) -> Self::Future;
 
     /// An optional convenience method allowing to implement both side handshake in one type
-    /// Intended to helps determining if handshake is working on client or server currently
+    /// Intended to help determining if handshake is working on client or server currently
     fn set_is_client(&mut self, bool) {}
 }
 
@@ -87,7 +87,7 @@ where
     type Future = Box<Future<Item = (Self::Item, S), Error = Error> + Send>;
     fn from_stream(self, stream: S) -> Self::Future {
         let Self { self_id, is_client } = self;
-        let framed = stream.framed(HelloHandshakeCodec);
+        let framed = HelloHandshakeCodec.framed(stream);
         if is_client {
             let future = framed.send(HelloHandshakeMessage::Hello(self_id)).and_then(
                 move |stream| {

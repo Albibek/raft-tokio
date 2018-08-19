@@ -4,19 +4,22 @@ version = "0.1.0"
 authors = ["Albibek <albibek@gmail.com>"]
 
 [dependencies]
-raft-consensus = { version = "^0.3", features = ["use_serde"] }
+raft-consensus = { version = "^0.4", features = ["use_serde", "use_capnp"] }
 tokio = { version = "^0.1" }
 failure_derive="^0.1"
 failure="^0.1"
 rmp-serde = "^0.13"
 futures = "^0.1"
 tokio-io = "^0.1"
+tokio-codec = "^0.1"
 bytes = "^0.4"
 serde = "^1.0"
 serde_derive = "^1.0"
 rand = "^0.4"
 slog = "^2.2"
 slog-stdlog = "^3.0"
+capnp="^0.9"
+capnp-futures="^0.9"
 
 
 [dev-dependencies]

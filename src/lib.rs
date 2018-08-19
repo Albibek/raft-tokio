@@ -1,26 +1,25 @@
-extern crate bytes;
-///! This is an implementation of Raft's networking(i.e. non-consensus) part using tokio framework
-///! intended to work with raft-consensus crate where the consensus logic is implemented
-///!
-///! What exactly is implemented:
-///! * Timers
-///! * Connecting and reconnecting
-///! * Decoding messages from network and passing them to consensus
-///! * (Obviously) taking messages consensus required to generate and passing them to network
-///!
-///! The main future - `RaftPeerProtocol` is stream and codec independent. Also there are
-///! futures helping to deal with TCP connections.
-///!
-///! # TCP connection handling
-///! In raft every node is equal to others. So main question here is, in TCP terms, which of nodes
-///! should be a client and which of them should be a server. To solve this problem we make the
-///! both sides to try to connect and make a side with bigger ServerId win. This is implemented in
-///! `RaftStart` future and is optional to use
-///!
-///! Acheiving these requirements gives us a flexibility about what side the connection is established
-///! from, so we could work around some typical firewall limitations(like DMZ) where there is a hard
-///! limit for connections being established from one segment to another, but there is almost no
-///! rules denying connecting in reverse direction
+//! This is an implementation of Raft's networking(i.e. non-consensus) part using tokio framework
+//! intended to work with raft-consensus crate where the consensus logic is implemented
+//!
+//! What exactly is implemented:
+//! * Timers
+//! * Connecting and reconnecting
+//! * Decoding messages from network and passing them to consensus
+//! * (Obviously) taking messages consensus required to generate and passing them to network
+//!
+//! The main future - `RaftPeerProtocol` is stream and codec independent. Also there are
+//! futures helping to deal with TCP connections.
+//!
+//! # TCP connection handling
+//! In raft every node is equal to others. So main question here is, in TCP terms, which of nodes
+//! should be a client and which of them should be a server. To solve this problem we make the
+//! both sides to try to connect and make a side with bigger ServerId win. This is implemented in
+//! `raft::RaftStart` future and is optional to use
+//!
+//! Acheiving these requirements gives us a flexibility about what side the connection is established
+//! from, so we could work around some typical firewall limitations(like DMZ) where there is a hard
+//! limit for connections being established from one segment to another, but there is almost no
+//! rules denying connecting in reverse direction
 // (this is a part about internals not needed in public docs)
 // For achieving such behaviour we do the following:
 // * we introduce a shared `Connections` structure where all alive connections
@@ -29,6 +28,7 @@ extern crate bytes;
 // * established connection (no matter what side from) is passed to protocol via channel
 // * when protocol detects disconnect, it sends the messsage to connection watcher
 // * the watcher is responsible to provide a new connection to protocol
+
 extern crate failure;
 #[macro_use]
 extern crate failure_derive;
@@ -41,8 +41,12 @@ extern crate serde;
 extern crate serde_derive;
 #[macro_use]
 extern crate slog;
+extern crate bytes;
+extern crate capnp;
+extern crate capnp_futures;
 extern crate slog_stdlog;
 extern crate tokio;
+extern crate tokio_codec;
 extern crate tokio_io;
 
 use std::collections::HashMap;
@@ -66,7 +70,7 @@ pub mod handshake;
 pub mod raft;
 pub mod tcp;
 
-use codec::RaftCodec;
+use codec::{RaftCapnpCodec, RaftMpackCodec};
 use handshake::{Handshake, HelloHandshake};
 pub use raft::Notifier;
 use raft::{RaftOptions, RaftPeerProtocol};
@@ -101,7 +105,8 @@ pub fn start_raft_tcp<RL, RM, L, N>(
     let handshake = HelloHandshake::new(id);
 
     // select protocol codec type
-    let codec = RaftCodec;
+    //let codec = RaftMpackCodec;
+    let codec = RaftCapnpCodec;
 
     // Spawn protocol actor
     let elog = logger.clone();
@@ -122,7 +127,7 @@ pub fn start_raft_tcp<RL, RM, L, N>(
         options,
     );
 
-    // create watcher
+    // create connection watcher
     let watcher = TcpWatch::new(
         id,
         nodes.clone(),

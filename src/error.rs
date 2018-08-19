@@ -1,4 +1,5 @@
 //! Error type with all possible errors
+use capnp;
 use raft_consensus::error::Error as ConsensusError;
 use raft_consensus::ServerId;
 use rmp_serde::decode::Error as DecodeError;
@@ -16,6 +17,9 @@ pub enum Error {
     Decoding(#[cause] DecodeError),
     #[fail(display = "encoding error")]
     Encoding(#[cause] EncodeError),
+
+    #[fail(display = "capnp error")]
+    Capnp(#[cause] capnp::Error),
 
     #[fail(display = "client-side handshake failed")]
     ClientHandshake,

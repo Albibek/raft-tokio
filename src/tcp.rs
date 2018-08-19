@@ -9,7 +9,6 @@ use tokio::prelude::future::*;
 use tokio::prelude::*;
 use tokio::spawn;
 use tokio::timer::Delay;
-use tokio_io::codec::{Decoder, Encoder, Framed};
 
 use futures::sync::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::IntoFuture;
@@ -19,6 +18,7 @@ use slog::Logger;
 use raft_consensus::message::*;
 use raft_consensus::ServerId;
 
+use codec::IntoTransport;
 use error::Error;
 use handshake::Handshake;
 use raft::RaftStart;
@@ -33,29 +33,37 @@ impl Default for Connections {
     }
 }
 
+// TODO: generalize it over stream to support TLS
+
 /// A watcher for client connections
 ///
 /// Accounts connections incoming over `disconnect_rx`, re-establishes them, doing a
 /// specified handshake and sends the ones that passed the handshake over new_conns channel
-pub struct TcpWatch<C, H> {
+pub struct TcpWatch<T, H>
+where
+    T: IntoTransport<TcpStream, PeerMessage> + Send + 'static,
+{
     id: ServerId,
     addrs: HashMap<ServerId, SocketAddr>,
     conns: Connections,
     disconnect_rx: UnboundedReceiver<ServerId>,
-    new_conns: UnboundedSender<(ServerId, Framed<TcpStream, C>)>,
-    codec: C,
+    new_conns: UnboundedSender<(ServerId, T::Transport)>,
+    transport: T,
     handshake: H,
     logger: Logger,
 }
 
-impl<C, H> TcpWatch<C, H> {
+impl<T, H> TcpWatch<T, H>
+where
+    T: IntoTransport<TcpStream, PeerMessage> + Send + 'static,
+{
     pub fn new(
         id: ServerId,
         addrs: HashMap<ServerId, SocketAddr>,
         conns: Connections,
-        new_conns: UnboundedSender<(ServerId, Framed<TcpStream, C>)>,
+        new_conns: UnboundedSender<(ServerId, T::Transport)>,
         disconnect_rx: UnboundedReceiver<ServerId>,
-        codec: C,
+        transport: T,
         handshake: H,
         logger: Logger,
     ) -> Self {
@@ -65,20 +73,17 @@ impl<C, H> TcpWatch<C, H> {
             conns,
             disconnect_rx,
             new_conns,
-            codec,
+            transport,
             handshake,
             logger,
         }
     }
 }
 
-impl<C, H> IntoFuture for TcpWatch<C, H>
+// TODO change cloneable transport to transport factory
+impl<T, H> IntoFuture for TcpWatch<T, H>
 where
-    C: Encoder<Item = PeerMessage, Error = Error>
-        + Decoder<Item = PeerMessage, Error = Error>
-        + Clone
-        + Send
-        + 'static,
+    T: IntoTransport<TcpStream, PeerMessage> + Clone + Send + 'static,
     H: Handshake<TcpStream, Item = ServerId> + Clone + Send + 'static,
 {
     type Item = ();
@@ -93,14 +98,14 @@ where
             disconnect_rx,
             new_conns,
             handshake,
-            codec,
+            transport,
             logger,
         } = self;
 
         let conns = conns.clone();
         let new_conns = new_conns.clone();
         let handshake = handshake.clone();
-        let codec = codec.clone();
+        let transport = transport.clone();
 
         // create a separate channel for internal disconnect signals
         // signal on this channel will mean client connection was failed before
@@ -129,10 +134,10 @@ where
                 let new_conns = new_conns.clone();
                 let mut client_handshake = handshake.clone();
                 client_handshake.set_is_client(true);
-                let codec = codec.clone();
+                let transport = transport.clone();
                 let client_future = client.into_future().and_then(move |stream| {
                     let mut start =
-                        RaftStart::new(id, conns, new_conns, stream, codec, client_handshake);
+                        RaftStart::new(id, conns, new_conns, stream, transport, client_handshake);
                     start.set_is_client(true);
                     start
                 });
@@ -217,22 +222,28 @@ impl IntoFuture for TcpClient {
 
 /// TcpServer works all the time raft exists, is responsible for keeping all connections
 /// to all nodes alive and in a single unique instance
-pub struct TcpServer<C, H> {
+pub struct TcpServer<T, H>
+where
+    T: IntoTransport<TcpStream, PeerMessage> + Send + 'static,
+{
     id: ServerId,
     listen: SocketAddr,
     peers: Connections,
-    tx: UnboundedSender<(ServerId, Framed<TcpStream, C>)>,
-    codec: C,
+    tx: UnboundedSender<(ServerId, T::Transport)>,
+    transport: T,
     handshake: H,
 }
 
-impl<C, H> TcpServer<C, H> {
+impl<T, H> TcpServer<T, H>
+where
+    T: IntoTransport<TcpStream, PeerMessage> + Send + 'static,
+{
     pub fn new(
         id: ServerId,
         listen: SocketAddr,
         conns: Connections,
-        tx: UnboundedSender<(ServerId, Framed<TcpStream, C>)>,
-        codec: C,
+        tx: UnboundedSender<(ServerId, T::Transport)>,
+        transport: T,
         handshake: H,
     ) -> Self {
         Self {
@@ -240,19 +251,15 @@ impl<C, H> TcpServer<C, H> {
             listen,
             peers: conns,
             tx,
-            codec,
+            transport,
             handshake,
         }
     }
 }
 
-impl<C, H> IntoFuture for TcpServer<C, H>
+impl<T, H> IntoFuture for TcpServer<T, H>
 where
-    C: Encoder<Item = PeerMessage, Error = Error>
-        + Decoder<Item = PeerMessage, Error = Error>
-        + Clone
-        + Send
-        + 'static,
+    T: IntoTransport<TcpStream, PeerMessage> + Clone + Send + 'static,
     H: Handshake<TcpStream, Item = ServerId> + Clone + Send + 'static,
 {
     type Item = ();
@@ -265,7 +272,7 @@ where
             listen,
             peers,
             tx,
-            codec,
+            transport,
             handshake,
         } = self;
         let listener = TcpListener::bind(&listen);
@@ -282,7 +289,7 @@ where
                     peers.clone(),
                     tx.clone(),
                     stream,
-                    codec.clone(),
+                    transport.clone(),
                     handshake.clone(),
                 );
                 start.set_is_client(false);

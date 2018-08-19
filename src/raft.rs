@@ -1,30 +1,25 @@
-//! Raft-related types and futures
+//! Raft related types and futures
 use std::collections::HashMap;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use futures::{future::Either,
-              sync::mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
-              Async,
-              Future,
-              Poll,
-              Sink,
-              Stream};
+use futures::{
+    future::Either,
+    sync::mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
+    Async, Future, Poll, Sink, Stream,
+};
 
-use raft_consensus::{handler::CollectHandler,
-                     message::{ClientResponse, ConsensusTimeout, PeerMessage},
-                     state::ConsensusState,
-                     ClientId,
-                     Consensus,
-                     Log,
-                     ServerId,
-                     StateMachine};
+use raft_consensus::{
+    handler::CollectHandler,
+    message::{ClientResponse, ConsensusTimeout, PeerMessage},
+    state::ConsensusState,
+    ClientId, Consensus, Log, ServerId, StateMachine,
+};
 use tokio::prelude::future::*;
 use tokio::timer::Delay;
-use tokio_io::{codec::{Decoder, Encoder, Framed},
-               AsyncRead,
-               AsyncWrite};
+use tokio_io::{AsyncRead, AsyncWrite};
 
+use codec::IntoTransport;
 use error::Error;
 use handshake::{Handshake, HandshakeExt};
 use rand::{OsRng, Rng};
@@ -60,27 +55,35 @@ impl RaftOptions {
 /// This future will handle all the actions required for raft to start:
 /// perform a handshake, save the conection and pass it through channel to raft dialog if everything is OK
 /// S is a stream being passed.
-/// C parameter is responsible for raft packets encoding
+/// T is a parameter is responsible for encoding/decoding raft packets from connection
 /// H is a future supposed to make a handshake returning ServerId and the rest of the stream as a
 /// result
 #[derive(Clone)]
-pub struct RaftStart<S, C, H> {
+pub struct RaftStart<S, T, H>
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+    T: IntoTransport<S, PeerMessage> + Send + 'static,
+{
     self_id: ServerId,
     peers: Connections,
-    tx: UnboundedSender<(ServerId, Framed<S, C>)>,
+    tx: UnboundedSender<(ServerId, T::Transport)>,
     stream: S,
+    transport: T,
     handshake: H,
-    codec: C,
     is_client: bool,
 }
 
-impl<S, C, H> RaftStart<S, C, H> where {
+impl<S, T, H> RaftStart<S, T, H>
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+    T: IntoTransport<S, PeerMessage> + Send + 'static,
+{
     pub fn new(
         self_id: ServerId,
         peers: Connections,
-        tx: UnboundedSender<(ServerId, Framed<S, C>)>,
+        tx: UnboundedSender<(ServerId, T::Transport)>,
         stream: S,
-        codec: C,
+        transport: T,
         handshake: H,
     ) -> Self {
         Self {
@@ -88,7 +91,7 @@ impl<S, C, H> RaftStart<S, C, H> where {
             peers,
             tx,
             stream,
-            codec,
+            transport,
             handshake,
             is_client: true,
         }
@@ -99,13 +102,10 @@ impl<S, C, H> RaftStart<S, C, H> where {
     }
 }
 
-impl<S, C, H> IntoFuture for RaftStart<S, C, H>
+impl<S, T, H> IntoFuture for RaftStart<S, T, H>
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
-    C: Encoder<Item = PeerMessage, Error = Error>
-        + Decoder<Item = PeerMessage, Error = Error>
-        + Send
-        + 'static,
+    T: IntoTransport<S, PeerMessage> + Send + 'static,
     H: Handshake<S, Item = ServerId> + Send + 'static,
 {
     type Item = ();
@@ -118,7 +118,7 @@ where
             peers,
             tx,
             stream,
-            codec,
+            transport,
             handshake,
             is_client,
         } = self;
@@ -139,9 +139,9 @@ where
                 if !new && !winner {
                     Either::A(failed(Error::DuplicateConnection(id)))
                 } else {
-                    let stream = stream.framed(codec);
+                    let framed = transport.into_transport(stream); //codec.framed(stream);
                     Either::B(
-                        tx.send((id, stream))
+                        tx.send((id, framed))
                             .map_err(|_| Error::SendConnection)
                             .map(|_| ()),
                     )
@@ -223,7 +223,8 @@ where
 
     fn apply_messages(&mut self) {
         let logger = self.options.logger.clone();
-        if self.handler.peer_messages.is_empty() && self.handler.timeouts.is_empty()
+        if self.handler.peer_messages.is_empty()
+            && self.handler.timeouts.is_empty()
             && self.handler.clear_timeouts.is_empty()
         {
             return;
