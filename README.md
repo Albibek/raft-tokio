@@ -1,18 +1,17 @@
 # raft-tokio
-**(WIP)**
 This crate implements a networking part of Raft consensus using tokio framework
 
+At current state crate can be(and is) used to connect some instances of something using raft protocol between 
+them and knowing if node a leader or if it's not.
+
+There is also a rafter example in rafter directory made as an example and as a test
+
 # Current state
-The project is in it's early-to-middle delvelopment stage. Some commits are compiling, some even work, but nothing is
-guaranteed yet.
-
-The commits that are known to work in some stable mode may be tagged with some tag.
-
 What currently works:
 * leader election
 * smart TCP connection handling
+* getting current consensus state
+* providing raft options
 
 What doesn't work:
-* client messaging RPC
-* getting current consensus state
-* providing options
+* client messaging
