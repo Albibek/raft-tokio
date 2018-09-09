@@ -8,7 +8,6 @@ raft-consensus = { version = "^0.4", features = ["use_serde", "use_capnp"] }
 tokio = { version = "^0.1" }
 failure_derive="^0.1"
 failure="^0.1"
-rmp-serde = "^0.13"
 futures = "^0.1"
 tokio-io = "^0.1"
 tokio-codec = "^0.1"
@@ -21,6 +20,10 @@ slog-stdlog = "^3.0"
 capnp="^0.9"
 capnp-futures="^0.9"
 
+
+[build-dependencies]
+capnpc = "^0.9"
+capnp = "^0.9"
 
 [dev-dependencies]
 slog = { version = "^2.2", features = ["max_level_trace"] }
