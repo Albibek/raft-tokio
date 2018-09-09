@@ -2,8 +2,6 @@
 use capnp;
 use raft_consensus::error::Error as ConsensusError;
 use raft_consensus::ServerId;
-use rmp_serde::decode::Error as DecodeError;
-use rmp_serde::encode::Error as EncodeError;
 use std::io;
 
 #[fail(display = "Raft error")]
@@ -13,13 +11,12 @@ pub enum Error {
     Consensus(#[cause] ConsensusError),
     #[fail(display = "I/O error: {:?}", _0)]
     Io(#[cause] io::Error),
-    #[fail(display = "decoding error")]
-    Decoding(#[cause] DecodeError),
-    #[fail(display = "encoding error")]
-    Encoding(#[cause] EncodeError),
 
     #[fail(display = "capnp error")]
     Capnp(#[cause] capnp::Error),
+
+    #[fail(display = "capnp schema error")]
+    CapnpSchema(#[cause] capnp::NotInSchema),
 
     #[fail(display = "client-side handshake failed")]
     ClientHandshake,

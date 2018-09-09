@@ -1,13 +1,8 @@
 //! Some simple initial handshake traits and implementations
-use bytes::BytesMut;
 use tokio::prelude::future::*;
 use tokio::prelude::*;
-use tokio_io::codec::{Decoder, Encoder};
 
-use bytes::{Buf, BufMut, IntoBuf};
 use raft_consensus::ServerId;
-use rmp_serde::decode::from_read;
-use rmp_serde::encode::write;
 
 use error::Error;
 
@@ -79,6 +74,32 @@ impl HelloHandshake {
     }
 }
 
+use capnp::message::Reader as CapnpReader;
+use capnp::message::DEFAULT_READER_OPTIONS;
+use capnp_futures::serialize::OwnedSegments;
+use capnp_futures::serialize::{read_message, write_message};
+use handshake_capnp::handshake as capnp_handshake;
+
+fn ehlo_from_reader(reader: CapnpReader<OwnedSegments>) -> Result<ServerId, Error> {
+    let message = reader
+        .get_root::<capnp_handshake::Reader>()
+        .map_err(Error::Capnp)?;
+    match message.which().map_err(Error::CapnpSchema)? {
+        capnp_handshake::Which::Hello(_) => Err(Error::ClientHandshake),
+        capnp_handshake::Which::Ehlo(id) => Ok(id.into()),
+    }
+}
+
+fn helo_from_reader(reader: CapnpReader<OwnedSegments>) -> Result<ServerId, Error> {
+    let message = reader
+        .get_root::<capnp_handshake::Reader>()
+        .map_err(Error::Capnp)?;
+    match message.which().map_err(Error::CapnpSchema)? {
+        capnp_handshake::Which::Ehlo(_) => Err(Error::ServerHandshake),
+        capnp_handshake::Which::Hello(id) => Ok(id.into()),
+    }
+}
+
 impl<S> Handshake<S> for HelloHandshake
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
@@ -87,40 +108,50 @@ where
     type Future = Box<Future<Item = (Self::Item, S), Error = Error> + Send>;
     fn from_stream(self, stream: S) -> Self::Future {
         let Self { self_id, is_client } = self;
-        let framed = HelloHandshakeCodec.framed(stream);
+
         if is_client {
-            let future = framed.send(HelloHandshakeMessage::Hello(self_id)).and_then(
-                move |stream| {
-                    stream
-                        .into_future()
-                        .map_err(|(e, _)| e) // second error is send error, we don't need it
-                        .and_then(move |(message, stream)| {
-                            if let Some(HelloHandshakeMessage::Ehlo(id)) = message {
-                                Either::A(ok((id, stream.into_inner())))
-                            } else {
-                                Either::B(failed(Error::ClientHandshake))
-                            }
-                        })
-                },
-            );
+            let mut builder = ::capnp::message::Builder::new_default();
+            {
+                let mut message = builder.init_root::<capnp_handshake::Builder>();
+                message.set_hello(self_id.into());
+            }
+            let future = write_message(stream, builder)
+                .and_then(move |(stream, _)| read_message(stream, DEFAULT_READER_OPTIONS))
+                .map_err(Error::Capnp)
+                .and_then(move |(stream, response)| {
+                    match response {
+                        Some(reader) => match ehlo_from_reader(reader) {
+                            Ok(id) => Either::A(ok((id.into(), stream))),
+                            Err(e) => Either::B(failed(e)),
+                        },
+                        None => Either::B(failed(Error::ClientHandshake)),
+                    }
+                });
+
             Box::new(future)
         } else {
-            let future = framed.into_future().map_err(move |(e, _)| e).and_then(
-                move |(maybe_id, stream)| {
-                    let id = if let HelloHandshakeMessage::Hello(id) = maybe_id.unwrap() {
-                        id
-                    } else {
-                        return Either::A(failed(Error::ServerHandshake));
-                    };
+         let future = read_message(stream, DEFAULT_READER_OPTIONS)
+             .map_err(Error::Capnp)
+             .and_then( move |(stream, request)| {
+                     match request {
+                        Some(reader) => match helo_from_reader(reader) {
+                            Ok(id) => Either::A(ok((id.into(), stream))),
+                            Err(e) => Either::B(failed(e)),
+                        },
+                        None => Either::B(failed(Error::ServerHandshake)),
+                    }
+        }).and_then(move |(id, stream)| {
+             let mut builder = ::capnp::message::Builder::new_default();
+            {
+                let mut message = builder.init_root::<capnp_handshake::Builder>();
+                message.set_ehlo(self_id.into());
+            }
+                 write_message(stream, builder).map(move |(stream, _)| {
+                     (id, stream)
+                 }).map_err(Error::Capnp)
 
-                    Either::B(
-                        stream
-                            .send(HelloHandshakeMessage::Ehlo(self_id))
-                            .map(move |stream| (id, stream.into_inner())),
-                    )
-                },
-            );
-            Box::new(future)
+             });
+         Box::new(future)
         }
     }
 
@@ -136,6 +167,7 @@ pub enum HelloHandshakeMessage {
     Ehlo(ServerId),
 }
 
+/*
 /// A MesssagePack encoder for handshaking
 pub struct HelloHandshakeCodec;
 
@@ -160,3 +192,4 @@ impl Encoder for HelloHandshakeCodec {
         Ok(())
     }
 }
+*/

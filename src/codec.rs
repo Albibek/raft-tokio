@@ -1,23 +1,17 @@
 //! Codecs for encoding/decoding Raft messages
-use bytes::BytesMut;
 use futures::{Async, AsyncSink, Poll, Sink, StartSend, Stream};
-use tokio_codec::{Decoder, Encoder, Framed};
 use tokio_io::{AsyncRead, AsyncWrite};
 
-use bytes::{Buf, BufMut, IntoBuf};
 use capnp::message::DEFAULT_READER_OPTIONS;
-use capnp::message::{Allocator, Builder, HeapAllocator};
+use capnp::message::{Builder, HeapAllocator};
 use capnp_futures;
 use raft_consensus::message::*;
-use rmp_serde::decode::from_read;
-use rmp_serde::encode::write;
 
 use error::Error;
 
 // TODO: some day this will be in a separate crate with error generalized or event absent
 // (since futures >0.1 will remove it)
 
-/// The meaning of Transport is the same as in now-deprecated tokio-proto crate
 /// Transport is a stream of frames instead of stream of bytes
 /// For simplicity we join Stream and Sink in a single trait because one sided streams/sinks are very
 /// rare as well as ones that use different types for input and output
@@ -32,11 +26,12 @@ where
     fn into_transport(self, stream: S) -> Self::Transport;
 }
 
+/*
+// TODO: generalize codec on any Serialize/Deserialize
 /// A MesssagePack codec for raft messages
 #[derive(Clone, Debug)]
 pub struct RaftMpackCodec;
 
-// TODO: generalize codec on any Serialize/Deserialize
 impl Decoder for RaftMpackCodec {
     type Item = PeerMessage;
     type Error = Error;
@@ -66,6 +61,7 @@ impl<S: AsyncRead + AsyncWrite + Send + 'static> IntoTransport<S, PeerMessage> f
         RaftMpackCodec.framed(stream)
     }
 }
+*/
 
 #[derive(Clone, Debug)]
 pub struct RaftCapnpCodec;
