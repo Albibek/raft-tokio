@@ -35,7 +35,6 @@ extern crate failure_derive;
 extern crate futures;
 pub extern crate raft_consensus;
 extern crate rand;
-extern crate rmp_serde;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
@@ -70,10 +69,14 @@ pub mod handshake;
 pub mod raft;
 pub mod tcp;
 
-use codec::{RaftCapnpCodec, RaftMpackCodec};
+pub mod handshake_capnp {
+    include!(concat!(env!("OUT_DIR"), "/schema/handshake_capnp.rs"));
+}
+
+use codec::RaftCapnpCodec;
 use handshake::{Handshake, HelloHandshake};
-pub use raft::Notifier;
-use raft::{RaftOptions, RaftPeerProtocol};
+pub use raft::{Notifier, RaftOptions};
+use raft::RaftPeerProtocol;
 use tcp::{Connections, TcpServer, TcpWatch};
 
 // TODO: tcp retry timeout
@@ -86,6 +89,7 @@ pub fn start_raft_tcp<RL, RM, L, N>(
     raft_log: RL,
     machine: RM,
     notifier: N,
+    options: RaftOptions,
     logger: L,
 ) where
     RL: Log + Send + 'static,
@@ -105,7 +109,6 @@ pub fn start_raft_tcp<RL, RM, L, N>(
     let handshake = HelloHandshake::new(id);
 
     // select protocol codec type
-    //let codec = RaftMpackCodec;
     let codec = RaftCapnpCodec;
 
     // Spawn protocol actor
@@ -113,11 +116,8 @@ pub fn start_raft_tcp<RL, RM, L, N>(
 
     let (disconnect_tx, disconnect_rx) = unbounded();
 
-    let mut options = RaftOptions::default();
-    options.set_logger(logger.clone());
-
     // prepare peer protocol handler
-    let (protocol, tx) = RaftPeerProtocol::new(
+    let (mut protocol, tx) = RaftPeerProtocol::new(
         id,
         node_vec,
         raft_log,
@@ -126,6 +126,8 @@ pub fn start_raft_tcp<RL, RM, L, N>(
         disconnect_tx.clone(),
         options,
     );
+
+    protocol.set_logger(logger.clone());
 
     // create connection watcher
     let watcher = TcpWatch::new(
@@ -176,6 +178,7 @@ mod tests {
     use std::collections::HashMap;
     use std::thread;
 
+    use raft::RaftOptions;
     use raft_consensus::persistent_log::mem::MemLog;
     use raft_consensus::state_machine::null::NullStateMachine;
     use raft_consensus::ServerId;
@@ -204,10 +207,13 @@ mod tests {
         let drain = slog_async::Async::new(filter).build().fuse();
         let rlog = slog::Logger::root(drain, o!("program"=>"test"));
 
+        let options = RaftOptions::default();
+
         for (id, addr) in nodes.clone().into_iter() {
             let nodes = nodes.clone();
 
             let log = rlog.new(o!("id" => format!("{:?}", id), "local_addr" => addr.to_string()));
+            let options = options.clone();
             let th = thread::Builder::new()
                 .name(format!("test-{:?}", id).to_string())
                 .spawn(move || {
@@ -223,11 +229,7 @@ mod tests {
                     let notifier = ::raft::DoNotNotify;
 
                     let raft = lazy(|| {
-                        if id == ServerId(1) {
-                            start_raft_tcp(id, nodes, raft_log, sm, notifier, log);
-                        } else {
-                            start_raft_tcp(id, nodes, raft_log, sm, notifier, log);
-                        }
+                        start_raft_tcp(id, nodes, raft_log, sm, notifier, options, log);
                         Ok(())
                     });
 

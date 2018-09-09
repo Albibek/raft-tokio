@@ -35,7 +35,7 @@ use raft_consensus::ServerId;
 
 //use raft_tokio::raft::RaftPeerProtocol;
 use raft_tokio::start_raft_tcp;
-use raft_tokio::Notifier;
+use raft_tokio::{Notifier, RaftOptions};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
@@ -154,15 +154,16 @@ fn main() {
     let raft_log = MemLog::new();
     let sm = NullStateMachine;
     let notifier = LeaderNotifier(log.clone());
+    let options = RaftOptions::default();
 
     // Create the runtime
     let mut runtime = Runtime::new().expect("creating runtime");
 
     let raft = lazy(move || {
         if id == ServerId(1) {
-            start_raft_tcp(id, nodes, raft_log, sm, notifier, log);
+            start_raft_tcp(id, nodes, raft_log, sm, notifier, options, log);
         } else {
-            start_raft_tcp(id, nodes, raft_log, sm, notifier, log);
+            start_raft_tcp(id, nodes, raft_log, sm, notifier, options, log);
         }
         Ok::<(), ()>(())
     });
