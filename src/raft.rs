@@ -11,9 +11,9 @@ use futures::{
 
 use raft_consensus::{
     handler::CollectHandler,
-    message::{ClientResponse, ConsensusTimeout, PeerMessage},
+    message::{ ConsensusTimeout, PeerMessage},
     state::ConsensusState,
-    ClientId, Consensus, Log, ServerId, StateMachine,
+    Consensus, Log, ServerId, StateMachine,
 };
 use tokio::prelude::future::*;
 use tokio::timer::Delay;
@@ -33,7 +33,6 @@ use Connections;
 pub struct RaftOptions {
     pub heartbeat_timeout: Duration,
     pub election_timeout: Range<Duration>,
-    pub logger: Logger,
 }
 
 impl Default for RaftOptions {
@@ -41,14 +40,7 @@ impl Default for RaftOptions {
         Self {
             heartbeat_timeout: Duration::from_millis(250),
             election_timeout: Duration::from_millis(500)..Duration::from_millis(750),
-            logger: Logger::root(StdLog.fuse(), o!()),
         }
-    }
-}
-
-impl RaftOptions {
-    pub fn set_logger(&mut self, logger: Logger) {
-        self.logger = logger
     }
 }
 
@@ -181,6 +173,7 @@ where
     election_timer: Option<Delay>,
     rng: OsRng,
     options: RaftOptions,
+    logger: Logger,
 }
 
 impl<S, L, M, N> RaftPeerProtocol<S, L, M, N>
@@ -216,13 +209,18 @@ where
             heartbeat_timers: HashMap::new(),
             election_timer: None,
             rng: OsRng::new().unwrap(),
+            logger: Logger::root(StdLog.fuse(), o!()),
             options,
         };
         (s, new_conns_tx)
     }
 
+    pub fn set_logger(&mut self, logger: Logger) {
+        self.logger = logger
+    }
+
     fn apply_messages(&mut self) {
-        let logger = self.options.logger.clone();
+        let logger = self.logger.clone();
         if self.handler.peer_messages.is_empty()
             && self.handler.timeouts.is_empty()
             && self.handler.clear_timeouts.is_empty()
@@ -327,16 +325,16 @@ where
             match self.new_conns_rx.poll() {
                 Ok(Async::NotReady) => break,
                 Ok(Async::Ready(Some((id, conn)))) => {
-                    info!(self.options.logger, "peer connected"; "peer"=>id.to_string());
+                    info!(self.logger, "peer connected"; "peer"=>id.to_string());
                     self.conns.insert(id, conn);
                 }
                 Ok(Async::Ready(None)) => {
                     // all senders are closed: finish the future
-                    info!(self.options.logger, "connection channel closed, exiting");
+                    info!(self.logger, "connection channel closed, exiting");
                     return Ok(Async::Ready(()));
                 }
                 Err(()) => {
-                    warn!(self.options.logger, "error polling for new connections"); // error is () here
+                    warn!(self.logger, "error polling for new connections"); // error is () here
                     break;
                 }
             }
@@ -346,7 +344,7 @@ where
 
         let mut remove = Vec::new();
         for id in keys {
-            let logger = self.options.logger.new(o!("peer" => id.to_string()));
+            let logger = self.logger.new(o!("peer" => id.to_string()));
             let mut ready;
             loop {
                 // new block here works around self.conns borrowing
@@ -404,25 +402,25 @@ where
         };
         match poll {
             Ok(Async::Ready(())) => {
-                trace!(self.options.logger, "election timeout");
+                trace!(self.logger, "election timeout");
                 self.consensus
                     .election_timeout(&mut self.handler)
                     .map_err(Error::Consensus)
                     .unwrap_or_else(
-                        |e| error!(self.options.logger, "Consensus error"; "error"=> e.to_string()),
+                        |e| error!(self.logger, "Consensus error"; "error"=> e.to_string()),
                     );
                 self.apply_messages();
             }
             Ok(Async::NotReady) => (),
             Err(e) => {
-                warn!(self.options.logger, "unexpected timer error"; "error" => e.to_string(), "timer"=>"election");
+                warn!(self.logger, "unexpected timer error"; "error" => e.to_string(), "timer"=>"election");
                 let timer = self.new_election_timer();
                 self.election_timer = Some(timer);
             }
         }
 
         let mut timed_out = Vec::new();
-        let logger = self.options.logger.clone();
+        let logger = self.logger.clone();
         for (id, timer) in &mut self.heartbeat_timers {
             match timer.poll() {
                 Ok(Async::Ready(())) => {
@@ -431,7 +429,7 @@ where
                 }
                 Ok(Async::NotReady) => (),
                 Err(e) => {
-                    warn!(self.options.logger, "unexpected timer error"; "error" => e.to_string(), "timer"=>"heartbeat", "peer"=>id.to_string());
+                    warn!(self.logger, "unexpected timer error"; "error" => e.to_string(), "timer"=>"heartbeat", "peer"=>id.to_string());
                     timed_out.push(Either::B(*id));
                 }
             };
@@ -447,7 +445,7 @@ where
                         })
                         .map_err(Error::Consensus)
                         .unwrap_or_else(
-                            |e| error!(self.options.logger, "Consensus error"; "error"=> e.to_string()),
+                            |e| error!(self.logger, "Consensus error"; "error"=> e.to_string()),
                         );
                     self.apply_messages();
                 }
