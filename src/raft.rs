@@ -11,7 +11,7 @@ use futures::{
 
 use raft_consensus::{
     handler::CollectHandler,
-    message::{ ConsensusTimeout, PeerMessage},
+    message::{ConsensusTimeout, PeerMessage},
     state::ConsensusState,
     Consensus, Log, ServerId, StateMachine,
 };
