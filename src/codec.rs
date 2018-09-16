@@ -12,9 +12,16 @@ use error::Error;
 // TODO: some day this will be in a separate crate with error generalized or event absent
 // (since futures >0.1 will remove it)
 
-/// Transport is a stream of frames instead of stream of bytes
-/// For simplicity we join Stream and Sink in a single trait because one sided streams/sinks are very
-/// rare as well as ones that use different types for input and output
+/// Transport is a stream of frames converted from stream of bytes.
+///
+/// Unlike tokio-io/tokio-codec it doesn't introduce any buffering and is a bit more general.
+/// Tokio's Decoders/Encoders are very simple to be adapted in a few lines of code.
+///
+/// For simplicity the Stream and Sink are currently joined in a single trait because one sided
+/// streams/sinks are very rare as well as ones that use different types for input and output
+///
+/// At the moment ths trait is still bound to this crate due to  error type. Some day it will end up in
+/// a separate crate maybe.
 pub trait IntoTransport<S, F>
 where
     S: AsyncRead + AsyncWrite + Send + 'static,

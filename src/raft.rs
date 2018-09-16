@@ -44,8 +44,9 @@ impl Default for RaftOptions {
     }
 }
 
-/// This future will handle all the actions required for raft to start:
-/// perform a handshake, save the conection and pass it through channel to raft dialog if everything is OK
+/// This future will handle all the actions required for raft to start.
+///
+/// Actions: Perform a handshake, save the conection and pass it through channel to raft dialog if everything is OK
 /// S is a stream being passed.
 /// T is a parameter is responsible for encoding/decoding raft packets from connection
 /// H is a future supposed to make a handshake returning ServerId and the rest of the stream as a

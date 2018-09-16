@@ -1,13 +1,13 @@
 //! This is an implementation of Raft's networking(i.e. non-consensus) part using tokio framework
 //! intended to work with raft-consensus crate where the consensus logic is implemented
 //!
-//! What exactly is implemented:
-//! * Timers
-//! * Connecting and reconnecting
-//! * Decoding messages from network and passing them to consensus
-//! * (Obviously) taking messages consensus required to generate and passing them to network
+//! What exactly this crate can currently do:
+//! * timers
+//! * connecting and reconnecting nodes to each other
+//! * decoding messages from network and passing them to consensus
+//! * (obviously) taking messages consensus required to generate and passing them to network
 //!
-//! The main future - `RaftPeerProtocol` is stream and codec independent. Also there are
+//! The main future - [`RaftPeerProtocol`] is stream and codec independent. Also there are
 //! futures helping to deal with TCP connections.
 //!
 //! # TCP connection handling
@@ -16,9 +16,9 @@
 //! both sides to try to connect and make a side with bigger ServerId win. This is implemented in
 //! `raft::RaftStart` future and is optional to use
 //!
-//! Acheiving these requirements gives us a flexibility about what side the connection is established
-//! from, so we could work around some typical firewall limitations(like DMZ) where there is a hard
-//! limit for connections being established from one segment to another, but there is almost no
+//! Acheiving these requirements gives a flexibility about what side the connection is established
+//! from, so we could work around some typical firewall limitations(like DMZ) where it is not always possible
+//! for connections to be established from one segment to another in one direction, but there is almost no
 //! rules denying connecting in reverse direction
 // (this is a part about internals not needed in public docs)
 // For achieving such behaviour we do the following:
@@ -80,8 +80,9 @@ use raft::RaftPeerProtocol;
 use tcp::{Connections, TcpServer, TcpWatch};
 
 // TODO: tcp retry timeout
-/// Starts typical Raft with TCP connection and simple handshake
-/// note that `peers` must contain a list of all peers including current node.
+/// Starts typical Raft with TCP connection and simple handshake.
+///
+/// Note that `peers` must contain a list of all peers including current node.
 /// Requires default tokio runtime to be already running, and may panic otherwise.
 pub fn start_raft_tcp<RL, RM, L, N>(
     id: ServerId,
