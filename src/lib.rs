@@ -13,8 +13,7 @@
 //! # TCP connection handling
 //! In raft every node is equal to others. So main question here is, in TCP terms, which of nodes
 //! should be a client and which of them should be a server. To solve this problem we make the
-//! both sides to try to connect and make a side with bigger ServerId win. This is implemented in
-//! `raft::RaftStart` future and is optional to use
+//! both sides to try to connect and make a check using `ConnectionSolver` trait.
 //!
 //! Acheiving these requirements gives a flexibility about what side the connection is established
 //! from, so we could work around some typical firewall limitations(like DMZ) where it is not always possible
@@ -75,8 +74,8 @@ pub mod handshake_capnp {
 
 use codec::RaftCapnpCodec;
 use handshake::{Handshake, HelloHandshake};
+use raft::{ConnectionSolver, RaftPeerProtocol};
 pub use raft::{Notifier, RaftOptions};
-use raft::RaftPeerProtocol;
 use tcp::{Connections, TcpServer, TcpWatch};
 
 // TODO: tcp retry timeout
@@ -84,7 +83,7 @@ use tcp::{Connections, TcpServer, TcpWatch};
 ///
 /// Note that `peers` must contain a list of all peers including current node.
 /// Requires default tokio runtime to be already running, and may panic otherwise.
-pub fn start_raft_tcp<RL, RM, L, N>(
+pub fn start_raft_tcp<RL, RM, L, N, C>(
     id: ServerId,
     mut nodes: HashMap<ServerId, SocketAddr>,
     raft_log: RL,
@@ -92,11 +91,13 @@ pub fn start_raft_tcp<RL, RM, L, N>(
     notifier: N,
     options: RaftOptions,
     logger: L,
+    solver: C,
 ) where
     RL: Log + Send + 'static,
     RM: StateMachine,
     L: Into<Option<Logger>>,
     N: Notifier + Send + 'static,
+    C: ConnectionSolver + Clone + Send + 'static,
 {
     let logger = logger
         .into()
@@ -140,6 +141,7 @@ pub fn start_raft_tcp<RL, RM, L, N>(
         codec.clone(),
         handshake.clone(),
         logger.clone(),
+        solver.clone(),
     );
 
     spawn(protocol.map_err(
@@ -158,6 +160,7 @@ pub fn start_raft_tcp<RL, RM, L, N>(
         tx.clone(),
         codec.clone(),
         srv_handshake,
+        solver,
     ).into_future();
 
     let elog = logger.clone();
@@ -179,7 +182,7 @@ mod tests {
     use std::collections::HashMap;
     use std::thread;
 
-    use raft::RaftOptions;
+    use raft::{BiggerIdSolver, RaftOptions};
     use raft_consensus::persistent_log::mem::MemLog;
     use raft_consensus::state_machine::null::NullStateMachine;
     use raft_consensus::ServerId;
@@ -227,10 +230,12 @@ mod tests {
 
                     // Create the runtime
                     let mut runtime = Runtime::new().expect("creating runtime");
+
                     let notifier = ::raft::DoNotNotify;
+                    let solver = BiggerIdSolver;
 
                     let raft = lazy(|| {
-                        start_raft_tcp(id, nodes, raft_log, sm, notifier, options, log);
+                        start_raft_tcp(id, nodes, raft_log, sm, notifier, options, log, solver);
                         Ok(())
                     });
 
@@ -238,8 +243,7 @@ mod tests {
                     runtime
                         .block_on(raft.and_then(|_| test_timeout))
                         .expect("runtime");
-                })
-                .unwrap();
+                }).unwrap();
             threads.push(th);
         }
         for t in threads {

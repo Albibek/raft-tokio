@@ -21,9 +21,9 @@ use raft_consensus::ServerId;
 use codec::IntoTransport;
 use error::Error;
 use handshake::Handshake;
-use raft::RaftStart;
+use raft::{ConnectionSolver, RaftStart};
 
-/// A shared connection pool to ensure client and server-side connections to be mutually exclusive
+/// A shared connection pool to ensure client- and server-side connections to be mutually exclusive
 #[derive(Debug, Clone)]
 pub struct Connections(pub(crate) Arc<Mutex<HashMap<ServerId, bool>>>);
 
@@ -39,9 +39,10 @@ impl Default for Connections {
 ///
 /// Accounts connections incoming over `disconnect_rx`, re-establishes them, doing a
 /// specified handshake and sends the ones that passed the handshake over new_conns channel
-pub struct TcpWatch<T, H>
+pub struct TcpWatch<T, H, C>
 where
     T: IntoTransport<TcpStream, PeerMessage> + Send + 'static,
+    C: ConnectionSolver + Send + 'static,
 {
     id: ServerId,
     addrs: HashMap<ServerId, SocketAddr>,
@@ -51,11 +52,13 @@ where
     transport: T,
     handshake: H,
     logger: Logger,
+    solver: C,
 }
 
-impl<T, H> TcpWatch<T, H>
+impl<T, H, C> TcpWatch<T, H, C>
 where
     T: IntoTransport<TcpStream, PeerMessage> + Send + 'static,
+    C: ConnectionSolver + Send + 'static,
 {
     pub fn new(
         id: ServerId,
@@ -66,6 +69,7 @@ where
         transport: T,
         handshake: H,
         logger: Logger,
+        solver: C,
     ) -> Self {
         Self {
             id,
@@ -76,15 +80,17 @@ where
             transport,
             handshake,
             logger,
+            solver,
         }
     }
 }
 
 // TODO change cloneable transport to transport factory
-impl<T, H> IntoFuture for TcpWatch<T, H>
+impl<T, H, C> IntoFuture for TcpWatch<T, H, C>
 where
     T: IntoTransport<TcpStream, PeerMessage> + Clone + Send + 'static,
     H: Handshake<TcpStream, Item = ServerId> + Clone + Send + 'static,
+    C: ConnectionSolver + Clone + Send + 'static,
 {
     type Item = ();
     type Error = ();
@@ -100,6 +106,7 @@ where
             handshake,
             transport,
             logger,
+            solver,
         } = self;
 
         let conns = conns.clone();
@@ -135,9 +142,10 @@ where
                 let mut client_handshake = handshake.clone();
                 client_handshake.set_is_client(true);
                 let transport = transport.clone();
+                let rsolver = solver.clone();
                 let client_future = client.into_future().and_then(move |stream| {
                     let mut start =
-                        RaftStart::new(id, conns, new_conns, stream, transport, client_handshake);
+                        RaftStart::new(id, conns, new_conns, stream, transport, client_handshake, rsolver);
                     start.set_is_client(true);
                     start
                 });
@@ -145,7 +153,7 @@ where
                 let internal_tx = internal_tx.clone();
                 let logger = logger.clone();
 
-                let delay = if is_client && id > dc_id {
+                let delay = if solver.solve(is_client, id, dc_id)  {
                     // we have priority on connect - reconnect immediately
                     Duration::from_millis(0)
                 } else {
@@ -222,9 +230,10 @@ impl IntoFuture for TcpClient {
 
 /// TcpServer works all the time raft exists, is responsible for keeping all connections
 /// to all nodes alive and in a single unique instance
-pub struct TcpServer<T, H>
+pub struct TcpServer<T, H, C>
 where
     T: IntoTransport<TcpStream, PeerMessage> + Send + 'static,
+    C: ConnectionSolver + Send + 'static,
 {
     id: ServerId,
     listen: SocketAddr,
@@ -232,11 +241,13 @@ where
     tx: UnboundedSender<(ServerId, T::Transport)>,
     transport: T,
     handshake: H,
+    solver: C,
 }
 
-impl<T, H> TcpServer<T, H>
+impl<T, H, C> TcpServer<T, H, C>
 where
     T: IntoTransport<TcpStream, PeerMessage> + Send + 'static,
+    C: ConnectionSolver + Send + 'static,
 {
     pub fn new(
         id: ServerId,
@@ -245,6 +256,7 @@ where
         tx: UnboundedSender<(ServerId, T::Transport)>,
         transport: T,
         handshake: H,
+        solver: C,
     ) -> Self {
         Self {
             id,
@@ -253,14 +265,16 @@ where
             tx,
             transport,
             handshake,
+            solver,
         }
     }
 }
 
-impl<T, H> IntoFuture for TcpServer<T, H>
+impl<T, H, C> IntoFuture for TcpServer<T, H, C>
 where
     T: IntoTransport<TcpStream, PeerMessage> + Clone + Send + 'static,
     H: Handshake<TcpStream, Item = ServerId> + Clone + Send + 'static,
+    C: ConnectionSolver + Clone + Send + 'static,
 {
     type Item = ();
     type Error = Error;
@@ -274,6 +288,7 @@ where
             tx,
             transport,
             handshake,
+            solver,
         } = self;
         let listener = TcpListener::bind(&listen);
         let listener = match listener {
@@ -291,6 +306,7 @@ where
                     stream,
                     transport.clone(),
                     handshake.clone(),
+                    solver.clone(),
                 );
                 start.set_is_client(false);
                 start.into_future()

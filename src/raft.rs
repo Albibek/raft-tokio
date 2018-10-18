@@ -44,6 +44,27 @@ impl Default for RaftOptions {
     }
 }
 
+/// This trait allows to check if the connection is a duplicate of another one
+/// made from other side. Connection will be dropped if `solve` returned false.
+/// Obviously, this is only checked if more than one connection is availableю
+pub trait ConnectionSolver {
+    fn solve(&self, is_client: bool, local_id: ServerId, remote_id: ServerId) -> bool;
+}
+
+/// A solver where connection with lower ServerId is dropped
+#[derive(Clone)]
+pub struct BiggerIdSolver;
+
+impl ConnectionSolver for BiggerIdSolver {
+    fn solve(&self, is_client: bool, local_id: ServerId, remote_id: ServerId) -> bool {
+        if is_client {
+            local_id > remote_id
+        } else {
+            remote_id > local_id
+        }
+    }
+}
+
 /// This future will handle all the actions required for raft to start.
 ///
 /// Actions: Perform a handshake, save the conection and pass it through channel to raft dialog if everything is OK
@@ -52,10 +73,11 @@ impl Default for RaftOptions {
 /// H is a future supposed to make a handshake returning ServerId and the rest of the stream as a
 /// result
 #[derive(Clone)]
-pub struct RaftStart<S, T, H>
+pub struct RaftStart<S, T, H, C>
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
     T: IntoTransport<S, PeerMessage> + Send + 'static,
+    C: ConnectionSolver + Send + 'static,
 {
     self_id: ServerId,
     peers: Connections,
@@ -64,12 +86,14 @@ where
     transport: T,
     handshake: H,
     is_client: bool,
+    conn_solver: C,
 }
 
-impl<S, T, H> RaftStart<S, T, H>
+impl<S, T, H, C> RaftStart<S, T, H, C>
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
     T: IntoTransport<S, PeerMessage> + Send + 'static,
+    C: ConnectionSolver + Send + 'static,
 {
     pub fn new(
         self_id: ServerId,
@@ -78,6 +102,7 @@ where
         stream: S,
         transport: T,
         handshake: H,
+        conn_solver: C,
     ) -> Self {
         Self {
             self_id,
@@ -86,6 +111,7 @@ where
             stream,
             transport,
             handshake,
+            conn_solver,
             is_client: true,
         }
     }
@@ -95,11 +121,12 @@ where
     }
 }
 
-impl<S, T, H> IntoFuture for RaftStart<S, T, H>
+impl<S, T, H, C> IntoFuture for RaftStart<S, T, H, C>
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
     T: IntoTransport<S, PeerMessage> + Send + 'static,
     H: Handshake<S, Item = ServerId> + Send + 'static,
+    C: ConnectionSolver + Send + 'static,
 {
     type Item = ();
     type Error = Error;
@@ -113,6 +140,7 @@ where
             stream,
             transport,
             handshake,
+            conn_solver,
             is_client,
         } = self;
         let fut = stream
@@ -124,12 +152,12 @@ where
                     new = true;
                     is_client
                 });
-                let winner = if is_client {
-                    self_id > id
-                } else {
-                    id > self_id
-                };
-                if !new && !winner {
+                // let winner = if is_client {
+                //self_id > id
+                //} else {
+                //id > self_id
+                // };
+                if !new && !conn_solver.solve(is_client, self_id, id) {
                     Either::A(failed(Error::DuplicateConnection(id)))
                 } else {
                     let framed = transport.into_transport(stream); //codec.framed(stream);
@@ -443,8 +471,7 @@ where
                         .heartbeat_timeout(id)
                         .map(|msg| {
                             self.handler.peer_messages.insert(id, vec![msg.into()]);
-                        })
-                        .map_err(Error::Consensus)
+                        }).map_err(Error::Consensus)
                         .unwrap_or_else(
                             |e| error!(self.logger, "Consensus error"; "error"=> e.to_string()),
                         );

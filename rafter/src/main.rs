@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use clap::Arg;
 use slog::{Drain, Level, Logger};
@@ -33,7 +34,8 @@ use raft_consensus::state::ConsensusState;
 use raft_consensus::state_machine::null::NullStateMachine;
 use raft_consensus::ServerId;
 
-//use raft_tokio::raft::RaftPeerProtocol;
+use raft::Notifier;
+use raft_tokio::raft::{BiggerIdSolver, ConnectionSolver};
 use raft_tokio::start_raft_tcp;
 use raft_tokio::{Notifier, RaftOptions};
 
@@ -68,16 +70,30 @@ impl Default for Config {
     }
 }
 
-struct LeaderNotifier(Logger);
+#[derive(Clone)]
+struct LeaderSave(Arc<Mutex<Option<bool>>>, Logger);
 
-impl Notifier for LeaderNotifier {
+impl Notifier for LeaderSave {
     fn state_changed(&mut self, old: ConsensusState, new: ConsensusState) {
+        let mut is_leader = self.0.lock().unwrap();
         if old != new {
             if new == ConsensusState::Leader {
-                warn!(self.0, "leader now")
+                warn!(self.1, "leader now") * is_leader = Some(true);
             } else if old == ConsensusState::Leader {
-                warn!(self.0, "lost leader")
+                warn!(self.1, "lost leader") * is_leader = Some(false);
             }
+        }
+    }
+}
+
+impl ConnectionSolver for LeaderSave {
+    fn solve(&self, is_client: bool, local_id: ServerId, remote_id: ServerId) -> bool {
+        if let Some(is_leader) = self.0.lock().unwrap() {
+            trace!(self.1, "leader is defined"; "is_leader" => is_leader);
+            return is_leader;
+        } else {
+            trace!(self.1, "leader is undefined");
+            return BiggerIdSolver.solve(is_client, local_id, remote_id);
         }
     }
 }
@@ -92,21 +108,18 @@ fn main() {
                 .required(true)
                 .takes_value(true)
                 .default_value("config.toml"),
-        )
-        .arg(
+        ).arg(
             Arg::with_name("verbosity")
                 .short("v")
                 .help("logging level")
                 .default_value("warn")
                 .takes_value(true),
-        )
-        .arg(
+        ).arg(
             Arg::with_name("id")
                 .index(1)
                 .required(true)
                 .help("id of current node (must exist in config)"),
-        )
-        .get_matches();
+        ).get_matches();
 
     let config = value_t!(app.value_of("config"), String).expect("config file must be string");
     let id = value_t!(app.value_of("id"), String).expect("ID must be string");
@@ -153,9 +166,12 @@ fn main() {
     // prepare consensus
     let raft_log = MemLog::new();
     let sm = NullStateMachine;
-    let notifier = LeaderNotifier(log.clone());
+    //let notifier = LeaderNotifier(log.clone());
     let options = RaftOptions::default();
 
+    let is_leader: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+    let notifier = LeaderSave(is_leader.clone(), log.clone());
+    let solver = notifier.clone();
     // Create the runtime
     let mut runtime = Runtime::new().expect("creating runtime");
 
