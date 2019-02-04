@@ -273,7 +273,7 @@ where
                         |e| warn!(elog, "could not complete packet send"; "remote"=>peer.to_string(), "error"=>e.to_string()),
                     );
                 } else {
-                    info!(logger, "skipped send to non-connected peer"; "remote"=>peer.to_string());
+                    warn!(logger, "skipped send to non-connected peer"; "remote"=>peer.to_string());
                 }
             }
         }
@@ -354,7 +354,7 @@ where
             match self.new_conns_rx.poll() {
                 Ok(Async::NotReady) => break,
                 Ok(Async::Ready(Some((id, conn)))) => {
-                    info!(self.logger, "peer connected"; "peer"=>id.to_string());
+                    warn!(self.logger, "peer connected"; "peer"=>id.to_string());
                     self.conns.insert(id, conn);
                 }
                 Ok(Async::Ready(None)) => {
