@@ -46,6 +46,7 @@ extern crate slog_stdlog;
 extern crate tokio;
 extern crate tokio_codec;
 extern crate tokio_io;
+extern crate net2;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

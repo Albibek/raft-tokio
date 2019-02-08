@@ -22,6 +22,8 @@ use codec::IntoTransport;
 use error::Error;
 use handshake::Handshake;
 use raft::{ConnectionSolver, RaftStart};
+use tokio::reactor::Handle;
+use net2::TcpBuilder;
 
 /// A shared connection pool to ensure client- and server-side connections to be mutually exclusive
 #[derive(Debug, Clone)]
@@ -135,7 +137,8 @@ where
                     Either::B(id) => (id, &addrs[&id]),
                 };
 
-                let client = TcpClient::new(*addr, Duration::from_millis(300));
+                let bind_addr = (addr.ip().to_string() + ":0").parse::<SocketAddr>().unwrap();
+                let client = TcpClient::new(*addr, Duration::from_millis(300), bind_addr);
 
                 let conns = conns.clone();
                 let new_conns = new_conns.clone();
@@ -190,11 +193,12 @@ where
 pub struct TcpClient {
     addr: SocketAddr,
     timeout: Duration,
+    bind_addr: SocketAddr,
 }
 
 impl TcpClient {
-    pub fn new(addr: SocketAddr, timeout: Duration) -> Self {
-        Self { addr, timeout }
+    pub fn new(addr: SocketAddr, timeout: Duration, bind_addr: SocketAddr) -> Self {
+       Self { addr, timeout, bind_addr }
     }
 }
 
@@ -204,7 +208,7 @@ impl IntoFuture for TcpClient {
     type Future = Box<Future<Item = Self::Item, Error = Self::Error> + Send>;
 
     fn into_future(self) -> Self::Future {
-        let Self { addr, timeout } = self;
+        let Self { addr, timeout, bind_addr } = self;
         let client = loop_fn(0, move |try| {
             // on a first try timeout is 0
             let dur = if try == 0 {
@@ -216,7 +220,9 @@ impl IntoFuture for TcpClient {
             let delay = Delay::new(Instant::now() + dur).then(|_| Ok(()));
 
             delay.and_then(move |()| {
-                TcpStream::connect(&addr).then(move |res| match res {
+                let tcp = TcpBuilder::new_v4().unwrap();
+                let tcp_stream = tcp.bind(bind_addr).unwrap().to_tcp_stream().unwrap();
+                TcpStream::connect_std(tcp_stream, &addr, &Handle::default()).then(move |res| match res {
                     Ok(stream) => ok(Loop::Break(stream)),
                     Err(_) => ok(Loop::Continue(try + 1)),
                 })
