@@ -136,8 +136,8 @@ where
                     }
                     Either::B(id) => (id, &addrs[&id]),
                 };
-
                 let bind_addr = (addr.ip().to_string() + ":0").parse::<SocketAddr>().unwrap();
+                debug!(logger.clone(), "bind raft client to {}", bind_addr.ip().to_string());
                 let client = TcpClient::new(*addr, Duration::from_millis(300), bind_addr);
 
                 let conns = conns.clone();
