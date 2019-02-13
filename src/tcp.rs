@@ -137,7 +137,6 @@ where
                     Either::B(id) => (id, &addrs[&id]),
                 };
                 let bind_addr = (addr.ip().to_string() + ":0").parse::<SocketAddr>().unwrap();
-                debug!(logger.clone(), "bind raft client to {}", bind_addr.ip().to_string());
                 let client = TcpClient::new(*addr, Duration::from_millis(300), bind_addr);
 
                 let conns = conns.clone();
@@ -221,11 +220,17 @@ impl IntoFuture for TcpClient {
 
             delay.and_then(move |()| {
                 let tcp = TcpBuilder::new_v4().unwrap();
-                let tcp_stream = tcp.bind(bind_addr).unwrap().to_tcp_stream().unwrap();
-                TcpStream::connect_std(tcp_stream, &addr, &Handle::default()).then(move |res| match res {
-                    Ok(stream) => ok(Loop::Break(stream)),
-                    Err(_) => ok(Loop::Continue(try + 1)),
-                })
+                match tcp.bind(bind_addr) {
+                    Ok(tcp_bind) => {
+                        let tcp_stream = tcp_bind.to_tcp_stream().unwrap();
+                        TcpStream::connect_std(tcp_stream, &addr, &Handle::default()).then(move |res| match res {
+                            Ok(stream) => ok(Loop::Break(stream)),
+                            Err(_) => ok(Loop::Continue(try + 1)),
+                        })
+                    },
+                    Err(err) =>
+                        panic!("unable bind raft client socket to {}: {:?}", bind_addr.to_string(), err),
+                }
             })
         });
         Box::new(client)
