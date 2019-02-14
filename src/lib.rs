@@ -133,6 +133,7 @@ pub fn start_raft_tcp<RL, RM, L, N, C>(
     protocol.set_logger(logger.clone());
 
     // create connection watcher
+    let bind_addr = (listen.ip().to_string() + ":0").parse::<SocketAddr>().unwrap();
     let watcher = TcpWatch::new(
         id,
         nodes.clone(),
@@ -143,6 +144,7 @@ pub fn start_raft_tcp<RL, RM, L, N, C>(
         handshake.clone(),
         logger.clone(),
         solver.clone(),
+        bind_addr,
     );
 
     spawn(protocol.map_err(
@@ -200,8 +202,8 @@ mod tests {
     fn temp_test() {
         let mut nodes: HashMap<ServerId, SocketAddr> = HashMap::new();
         nodes.insert(1.into(), "127.0.0.1:9991".parse().unwrap());
-        nodes.insert(2.into(), "127.0.0.1:9992".parse().unwrap());
-        nodes.insert(3.into(), "127.0.0.1:9993".parse().unwrap());
+        nodes.insert(2.into(), "127.0.0.2:9992".parse().unwrap());
+        nodes.insert(3.into(), "127.0.0.3:9993".parse().unwrap());
         //nodes.insert(4.into(), "127.0.0.1:9994".parse().unwrap());
 
         let mut threads = Vec::new();

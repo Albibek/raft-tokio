@@ -55,6 +55,7 @@ where
     handshake: H,
     logger: Logger,
     solver: C,
+    bind_addr: SocketAddr,
 }
 
 impl<T, H, C> TcpWatch<T, H, C>
@@ -72,6 +73,7 @@ where
         handshake: H,
         logger: Logger,
         solver: C,
+        bind_addr: SocketAddr,
     ) -> Self {
         Self {
             id,
@@ -83,6 +85,7 @@ where
             handshake,
             logger,
             solver,
+            bind_addr,
         }
     }
 }
@@ -109,6 +112,7 @@ where
             transport,
             logger,
             solver,
+            bind_addr,
         } = self;
 
         let conns = conns.clone();
@@ -136,7 +140,6 @@ where
                     }
                     Either::B(id) => (id, &addrs[&id]),
                 };
-                let bind_addr = (addr.ip().to_string() + ":0").parse::<SocketAddr>().unwrap();
                 let client = TcpClient::new(*addr, Duration::from_millis(300), bind_addr);
 
                 let conns = conns.clone();
