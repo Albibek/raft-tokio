@@ -484,6 +484,7 @@ where
             }
         }
         if state != self.handler.state {
+            //trace!(logger, "state {} -> {}", raft_consensus_state_fmt(&self.handler.state), raft_consensus_state_fmt(&state));
             self.notifier
                 .state_changed(state, self.handler.state.clone());
         }
