@@ -1,12 +1,15 @@
 //! Types and futures responsible for handling TCP aspects of protocol
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::io::Error as IoError;
+use std::marker::PhantomData;
+use std::net::{SocketAddr, TcpStream as StdTcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::prelude::future::*;
 use tokio::prelude::*;
+use tokio::reactor::Handle;
 use tokio::spawn;
 use tokio::timer::Delay;
 
@@ -21,6 +24,7 @@ use raft_consensus::ServerId;
 use codec::IntoTransport;
 use error::Error;
 use handshake::Handshake;
+use net2::TcpBuilder;
 use raft::RaftStart;
 
 /// A shared connection pool to ensure client and server-side connections to be mutually exclusive
@@ -33,15 +37,43 @@ impl Default for Connections {
     }
 }
 
-// TODO: generalize it over stream to support TLS
+// TODO: remove box, but when futures stabilize
+
+/// A factory that can produce connections like TCP(i.e. with different socket options) or TLS
+pub trait ConnectionMaker<S, F>
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+    F: IntoFuture<Item = S, Error = Error, Future = Box<Future<Item = S, Error = Error> + Send>>
+        + Send
+        + 'static,
+{
+    fn make_connection(&self, addr: SocketAddr) -> F;
+}
 
 /// A watcher for client connections
 ///
-/// Accounts connections incoming over `disconnect_rx`, re-establishes them, doing a
-/// specified handshake and sends the ones that passed the handshake over new_conns channel
-pub struct TcpWatch<T, H>
+/// This is a high level interface over making a connection - TCP or not, it doesn't matter
+/// because lots of things are generic. Such approach gives a possibility to use any transport
+/// with Raft without binding it to something speficic. TCP, UDP, QUIC, any future transport
+/// protocol is possible.
+///
+/// The future itself itakes care about connections accounting: watching one that are lost on `disconnect_rx` channel,
+/// re-establishing them, performing a specified handshake and sending the ones that passed the handshake over
+/// `new_conns` channel
+///
+/// T is the resulting transport
+/// S is the connection itself as tokio sees it
+/// C is a hook for setting up the initial connection options before starting connecting, it's future F should create
+/// the connection
+pub struct TcpWatch<T, H, S, C, F>
 where
-    T: IntoTransport<TcpStream, PeerMessage> + Send + 'static,
+    T: IntoTransport<S, PeerMessage> + Send + 'static,
+    S: AsyncRead + AsyncWrite + Send + 'static,
+    C: ConnectionMaker<S, F>,
+
+    F: IntoFuture<Item = S, Error = Error, Future = Box<Future<Item = S, Error = Error> + Send>>
+        + Send
+        + 'static,
 {
     id: ServerId,
     addrs: HashMap<ServerId, SocketAddr>,
@@ -50,12 +82,19 @@ where
     new_conns: UnboundedSender<(ServerId, T::Transport)>,
     transport: T,
     handshake: H,
+    factory: C,
     logger: Logger,
+    _pd: PhantomData<F>,
 }
 
-impl<T, H> TcpWatch<T, H>
+impl<T, H, S, C, F> TcpWatch<T, H, S, C, F>
 where
-    T: IntoTransport<TcpStream, PeerMessage> + Send + 'static,
+    T: IntoTransport<S, PeerMessage> + Send + 'static,
+    S: AsyncRead + AsyncWrite + Send + 'static,
+    C: ConnectionMaker<S, F>,
+    F: IntoFuture<Item = S, Error = Error, Future = Box<Future<Item = S, Error = Error> + Send>>
+        + Send
+        + 'static,
 {
     pub fn new(
         id: ServerId,
@@ -65,6 +104,7 @@ where
         disconnect_rx: UnboundedReceiver<ServerId>,
         transport: T,
         handshake: H,
+        factory: C,
         logger: Logger,
     ) -> Self {
         Self {
@@ -75,16 +115,22 @@ where
             new_conns,
             transport,
             handshake,
+            factory,
             logger,
+            _pd: PhantomData,
         }
     }
 }
 
-// TODO change cloneable transport to transport factory
-impl<T, H> IntoFuture for TcpWatch<T, H>
+impl<T, H, S, C, F> IntoFuture for TcpWatch<T, H, S, C, F>
 where
-    T: IntoTransport<TcpStream, PeerMessage> + Clone + Send + 'static,
-    H: Handshake<TcpStream, Item = ServerId> + Clone + Send + 'static,
+    T: IntoTransport<S, PeerMessage> + Clone + Send + 'static,
+    H: Handshake<S, Item = ServerId> + Clone + Send + 'static,
+    S: AsyncRead + AsyncWrite + Send + 'static,
+    C: ConnectionMaker<S, F> + Send + 'static,
+    F: IntoFuture<Item = S, Error = Error, Future = Box<Future<Item = S, Error = Error> + Send>>
+        + Send
+        + 'static,
 {
     type Item = ();
     type Error = ();
@@ -98,8 +144,10 @@ where
             disconnect_rx,
             new_conns,
             handshake,
+            factory,
             transport,
             logger,
+            ..
         } = self;
 
         let conns = conns.clone();
@@ -117,6 +165,7 @@ where
             .select(internal_rx.map(Either::B))
             .for_each(move |dc_id| {
                 let mut is_client = true;
+
                 let (dc_id, addr) = match dc_id {
                     Either::A(id) => {
                         let addr = &addrs[&id];
@@ -128,14 +177,14 @@ where
                     Either::B(id) => (id, &addrs[&id]),
                 };
 
-                let client = TcpClient::new(*addr, Duration::from_millis(300));
+                //let client = TcpClient::new(*addr, Duration::from_millis(300));
 
                 let conns = conns.clone();
                 let new_conns = new_conns.clone();
                 let mut client_handshake = handshake.clone();
                 client_handshake.set_is_client(true);
                 let transport = transport.clone();
-                let client_future = client.into_future().and_then(move |stream| {
+                let client_future = factory.make_connection(*addr).into_future().and_then(move |stream| {
                     let mut start =
                         RaftStart::new(id, conns, new_conns, stream, transport, client_handshake);
                     start.set_is_client(true);
@@ -167,7 +216,7 @@ where
                                 .map_err(|_| ());
                             Either::B(
                                 delay.and_then(move |_| internal_tx.send(dc_id).then(|_| Ok(()))),
-                            )
+                                )
                         }
                     })
                 });
@@ -178,25 +227,79 @@ where
     }
 }
 
-/// TCP client that is reconnecting forever until success
-pub struct TcpClient {
-    addr: SocketAddr,
+pub struct CustomTcpClientMaker<F>
+where
+    for<'r> F: FnMut(&'r mut StdTcpStream) -> Result<(), IoError> + Clone + Send + 'static,
+{
     timeout: Duration,
+    callback: F,
 }
 
-impl TcpClient {
-    pub fn new(addr: SocketAddr, timeout: Duration) -> Self {
-        Self { addr, timeout }
+impl<F> CustomTcpClientMaker<F>
+where
+    for<'r> F: FnMut(&'r mut StdTcpStream) -> Result<(), IoError> + Clone + Send + 'static,
+{
+    pub fn new(timeout: Duration, callback: F) -> Self {
+        Self { timeout, callback }
     }
 }
 
-impl IntoFuture for TcpClient {
+impl<F> ConnectionMaker<TcpStream, TcpClient<F>> for CustomTcpClientMaker<F>
+where
+    for<'r> F: FnMut(&'r mut StdTcpStream) -> Result<(), IoError> + Clone + Send + 'static,
+{
+    fn make_connection(&self, addr: SocketAddr) -> TcpClient<F> {
+        TcpClient::new(addr, self.timeout.clone(), self.callback.clone())
+    }
+}
+
+pub struct TcpClientMaker;
+
+impl TcpClientMaker {
+    pub fn new(
+        timeout: Duration,
+    ) -> CustomTcpClientMaker<impl FnMut(&mut StdTcpStream) -> Result<(), IoError> + Clone> {
+        CustomTcpClientMaker::new(timeout, |_| Ok(()))
+    }
+}
+
+/// TCP client that is reconnecting forever until success
+pub struct TcpClient<F>
+where
+    for<'r> F: FnMut(&'r mut StdTcpStream) -> Result<(), IoError> + Clone + Send + 'static,
+{
+    addr: SocketAddr,
+    timeout: Duration,
+    callback: F,
+}
+
+impl<F> TcpClient<F>
+where
+    for<'r> F: FnMut(&'r mut StdTcpStream) -> Result<(), IoError> + Clone + Send + 'static,
+{
+    pub fn new(addr: SocketAddr, timeout: Duration, callback: F) -> Self {
+        Self {
+            addr,
+            timeout,
+            callback,
+        }
+    }
+}
+
+impl<F> IntoFuture for TcpClient<F>
+where
+    for<'r> F: FnMut(&'r mut StdTcpStream) -> Result<(), IoError> + Clone + Send + 'static,
+{
     type Item = TcpStream;
     type Error = Error;
     type Future = Box<Future<Item = Self::Item, Error = Self::Error> + Send>;
 
     fn into_future(self) -> Self::Future {
-        let Self { addr, timeout } = self;
+        let Self {
+            addr,
+            timeout,
+            callback,
+        } = self;
         let client = loop_fn(0, move |try| {
             // on a first try timeout is 0
             let dur = if try == 0 {
@@ -207,11 +310,35 @@ impl IntoFuture for TcpClient {
 
             let delay = Delay::new(Instant::now() + dur).then(|_| Ok(()));
 
-            delay.and_then(move |()| {
-                TcpStream::connect(&addr).then(move |res| match res {
-                    Ok(stream) => ok(Loop::Break(stream)),
-                    Err(_) => ok(Loop::Continue(try + 1)),
-                })
+            let mut callback = callback.clone();
+            let mut stream_init = move || -> Result<StdTcpStream, IoError> {
+                let stream = match addr {
+                    SocketAddr::V4(_) => TcpBuilder::new_v4()?,
+                    SocketAddr::V6(_) => net2::TcpBuilder::new_v6()?,
+                };
+
+                let mut stream = stream.to_tcp_stream()?;
+                callback(&mut stream)?;
+
+                Ok(stream)
+            };
+            delay.and_then(move |()| match stream_init() {
+                Ok(stream) => {
+                    let future = TcpStream::connect_std(stream, &addr, &Handle::default()).then(
+                        move |res| match res {
+                            Ok(stream) => ok(Loop::Break(stream)),
+                            Err(_) => ok(Loop::Continue(try + 1)),
+                        },
+                    );
+                    Box::new(future)
+                        as Box<
+                            Future<Item = Loop<TcpStream, usize>, Error = Self::Error>
+                                + Send
+                                + 'static,
+                        >
+                }
+                // TODO: log error
+                Err(_e) => Box::new(ok(Loop::Continue(try + 1))),
             })
         });
         Box::new(client)
@@ -222,25 +349,29 @@ impl IntoFuture for TcpClient {
 
 /// TcpServer works all the time raft exists, is responsible for keeping all connections
 /// to all nodes alive and in a single unique instance
-pub struct TcpServer<T, H>
+pub struct TcpServer<T, H, S, L>
 where
-    T: IntoTransport<TcpStream, PeerMessage> + Send + 'static,
+    T: IntoTransport<S, PeerMessage> + Send + 'static,
+    S: AsyncRead + AsyncWrite + Send + 'static,
+    L: Stream<Item = S, Error = IoError> + Send + 'static,
 {
     id: ServerId,
-    listen: SocketAddr,
+    listener: L,
     peers: Connections,
     tx: UnboundedSender<(ServerId, T::Transport)>,
     transport: T,
     handshake: H,
 }
 
-impl<T, H> TcpServer<T, H>
+impl<T, H, S, L> TcpServer<T, H, S, L>
 where
-    T: IntoTransport<TcpStream, PeerMessage> + Send + 'static,
+    T: IntoTransport<S, PeerMessage> + Send + 'static,
+    S: AsyncRead + AsyncWrite + Send + 'static,
+    L: Stream<Item = S, Error = IoError> + Send + 'static,
 {
     pub fn new(
         id: ServerId,
-        listen: SocketAddr,
+        listener: L,
         conns: Connections,
         tx: UnboundedSender<(ServerId, T::Transport)>,
         transport: T,
@@ -248,7 +379,7 @@ where
     ) -> Self {
         Self {
             id,
-            listen,
+            listener,
             peers: conns,
             tx,
             transport,
@@ -257,10 +388,12 @@ where
     }
 }
 
-impl<T, H> IntoFuture for TcpServer<T, H>
+impl<T, H, S, L> IntoFuture for TcpServer<T, H, S, L>
 where
-    T: IntoTransport<TcpStream, PeerMessage> + Clone + Send + 'static,
-    H: Handshake<TcpStream, Item = ServerId> + Clone + Send + 'static,
+    T: IntoTransport<S, PeerMessage> + Clone + Send + 'static,
+    H: Handshake<S, Item = ServerId> + Clone + Send + 'static,
+    S: AsyncRead + AsyncWrite + Send + 'static,
+    L: Stream<Item = S, Error = IoError> + Send + 'static,
 {
     type Item = ();
     type Error = Error;
@@ -269,19 +402,15 @@ where
     fn into_future(self) -> Self::Future {
         let Self {
             id,
-            listen,
+            listener,
             peers,
             tx,
             transport,
             handshake,
         } = self;
-        let listener = TcpListener::bind(&listen);
-        let listener = match listener {
-            Ok(i) => i,
-            Err(e) => return Box::new(failed(Error::Io(e))),
-        };
+
         let fut = listener
-            .incoming()
+            //.incoming()
             .map_err(Error::Io)
             .for_each(move |stream| {
                 let mut start = RaftStart::new(
@@ -293,7 +422,8 @@ where
                     handshake.clone(),
                 );
                 start.set_is_client(false);
-                start.into_future()
+                start
+                    .into_future()
                     // this avoids server exit on connection-level errors
                     // TODO: probably add logger to log RaftStart issues from here
                     .then(|_| Ok(()))

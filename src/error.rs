@@ -7,6 +7,8 @@ use std::io;
 #[fail(display = "Raft error")]
 #[derive(Fail, Debug)]
 pub enum Error {
+    //    #[fail(display = "building error: {:?}", _0)]
+    //    Builder(String),
     #[fail(display = "consensus error: {:?}", _0)]
     Consensus(#[cause] ConsensusError),
     #[fail(display = "I/O error: {:?}", _0)]
@@ -25,7 +27,10 @@ pub enum Error {
 
     #[fail(display = "sending connection to protocol handler")]
     SendConnection,
-    #[fail(display = "connection with {:?} removed by higher priority connection", _0)]
+    #[fail(
+        display = "connection with {:?} removed by higher priority connection",
+        _0
+    )]
     DuplicateConnection(ServerId),
     #[fail(display = "third party error: {:?}", _0)]
     Other(Option<String>),

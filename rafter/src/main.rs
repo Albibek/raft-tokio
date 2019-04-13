@@ -15,6 +15,7 @@ extern crate tokio;
 extern crate slog_async;
 extern crate slog_term;
 
+extern crate net2;
 extern crate raft_tokio;
 
 use std::collections::HashMap;
@@ -159,11 +160,28 @@ fn main() {
     // Create the runtime
     let mut runtime = Runtime::new().expect("creating runtime");
 
+    let this_listen = this.listen.clone();
     let raft = lazy(move || {
         if id == ServerId(1) {
-            start_raft_tcp(id, nodes, raft_log, sm, notifier, options, log);
+            start_raft_tcp(
+                id,
+                nodes,
+                raft_log,
+                sm,
+                notifier,
+                options,
+                log,
+                move |socket| {
+                    use net2::TcpBuilder;
+                    use std::os::unix::io::{AsRawFd, FromRawFd};
+                    let builder = unsafe { TcpBuilder::from_raw_fd(socket.as_raw_fd()) };
+                    builder.bind(this_listen)?;
+                    *socket = builder.to_tcp_stream()?; // ensure the ownership is passed back from builder
+                    Ok(())
+                },
+            );
         } else {
-            start_raft_tcp(id, nodes, raft_log, sm, notifier, options, log);
+            start_raft_tcp(id, nodes, raft_log, sm, notifier, options, log, |_| Ok(()));
         }
         Ok::<(), ()>(())
     });

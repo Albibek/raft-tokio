@@ -43,19 +43,21 @@ extern crate slog;
 extern crate bytes;
 extern crate capnp;
 extern crate capnp_futures;
+extern crate net2;
 extern crate slog_stdlog;
 extern crate tokio;
 extern crate tokio_codec;
 extern crate tokio_io;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpStream as StdTcpStream};
+use std::time::Duration;
 
 use futures::{Future, IntoFuture, Sink};
 
 use futures::sync::mpsc::unbounded;
 use tokio::executor::spawn;
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 
 use slog::{Drain, Logger};
 use slog_stdlog::StdLog;
@@ -75,16 +77,91 @@ pub mod handshake_capnp {
 
 use codec::RaftCapnpCodec;
 use handshake::{Handshake, HelloHandshake};
-pub use raft::{Notifier, RaftOptions};
 use raft::RaftPeerProtocol;
+pub use raft::{Notifier, RaftOptions};
 use tcp::{Connections, TcpServer, TcpWatch};
+
+//pub struct RaftTcpBuilder<RL, RM, L, N, F>
+//where
+//RL: Log + Send + 'static,
+//RM: StateMachine,
+//L: Into<Option<Logger>>,
+//N: Notifier + Send + 'static,
+//for<'r> F: FnMut(&'r mut net::TcpStream) + Clone + Send + 'static,
+//{
+//id: ServerId,
+//nodes: HashMap<ServerId, SocketAddr>,
+//node_ids: Vec<ServerId>,
+//raft_log: RL,
+//machine: RM,
+//notifier: N,
+//options: RaftOptions,
+//logger: L,
+//client_hook: F,
+//}
+
+//impl<RL, RM, L, N, F> RaftTcpBuilder<RL, RM, L, N, F>
+//where
+//RL: Log + Send + 'static,
+//RM: StateMachine,
+//L: Into<Option<Logger>>,
+//N: Notifier + Send + 'static,
+//for<'r> F: FnMut(&'r mut net::TcpStream) + Clone + Send + 'static,
+//{
+//pub fn new(id: ServerId) -> Self {
+//Self {
+//id,
+//nodes: Vec:
+////
+//}
+//}
+
+///// Return a ready to run future
+//pub fn build() -> Result<RaftTcpService<RL, RM, L, N, F>, Error> {}
+
+///// Add a remote node
+//pub fn add_node(&mut self, id: ServerId, node: SocketAddr) {
+////
+//}
+
+///// Add a hook for setting socket options for new tcp connection
+//pub fn set_client_hook(&mut self, hook: F) {
+////
+//}
+
+//pub fn set_raft_heartbeat_timeout(&mut self, duration: Duration) {
+////
+//}
+
+//}
+
+//pub struct RaftTcpService<RL, RM, L, N, F>
+//where
+//RL: Log + Send + 'static,
+//RM: StateMachine,
+//L: Into<Option<Logger>>,
+//N: Notifier + Send + 'static,
+//for<'r> F: FnMut(&'r mut StdTcpStream) + Clone + Send + 'static,
+//{
+//id: ServerId,
+//nodes: HashMap<ServerId, SocketAddr>,
+//raft_log: RL,
+//machine: RM,
+//notifier: N,
+//options: RaftOptions,
+//logger: L,
+//conn_hook: F,
+//}
+
+//impl IntoFuture for RaftTcpService {}
 
 // TODO: tcp retry timeout
 /// Starts typical Raft with TCP connection and simple handshake.
 ///
 /// Note that `peers` must contain a list of all peers including current node.
 /// Requires default tokio runtime to be already running, and may panic otherwise.
-pub fn start_raft_tcp<RL, RM, L, N>(
+/// also panics on other errors
+pub fn start_raft_tcp<RL, RM, L, N, F>(
     id: ServerId,
     mut nodes: HashMap<ServerId, SocketAddr>,
     raft_log: RL,
@@ -92,18 +169,20 @@ pub fn start_raft_tcp<RL, RM, L, N>(
     notifier: N,
     options: RaftOptions,
     logger: L,
+    conn_hook: F,
 ) where
     RL: Log + Send + 'static,
     RM: StateMachine,
     L: Into<Option<Logger>>,
     N: Notifier + Send + 'static,
+    for<'r> F: FnMut(&'r mut StdTcpStream) -> Result<(), std::io::Error> + Clone + Send + 'static,
 {
     let logger = logger
         .into()
         .unwrap_or_else(|| Logger::root(StdLog.fuse(), o!()));
     let conns = Connections::default();
 
-    let listen = nodes.remove(&id).unwrap();
+    let listen = nodes.remove(&id).expect("node id not found in node list");
     let node_vec = nodes.keys().cloned().collect();
 
     // select protocol handshake type
@@ -130,6 +209,7 @@ pub fn start_raft_tcp<RL, RM, L, N>(
 
     protocol.set_logger(logger.clone());
 
+    let conn_maker = tcp::CustomTcpClientMaker::new(Duration::from_millis(300), conn_hook);
     // create connection watcher
     let watcher = TcpWatch::new(
         id,
@@ -139,6 +219,7 @@ pub fn start_raft_tcp<RL, RM, L, N>(
         disconnect_rx,
         codec.clone(),
         handshake.clone(),
+        conn_maker,
         logger.clone(),
     );
 
@@ -151,14 +232,17 @@ pub fn start_raft_tcp<RL, RM, L, N>(
     // spawn TCP server
     let mut srv_handshake = handshake.clone();
     Handshake::<TcpStream>::set_is_client(&mut srv_handshake, false);
+    let listener = TcpListener::bind(&listen).expect("tcp listener couldn't start");
+
     let server = TcpServer::new(
         id,
-        listen,
+        listener.incoming(),
         conns.clone(),
         tx.clone(),
         codec.clone(),
         srv_handshake,
-    ).into_future();
+    )
+    .into_future();
 
     let elog = logger.clone();
     spawn(
@@ -230,7 +314,7 @@ mod tests {
                     let notifier = ::raft::DoNotNotify;
 
                     let raft = lazy(|| {
-                        start_raft_tcp(id, nodes, raft_log, sm, notifier, options, log);
+                        start_raft_tcp(id, nodes, raft_log, sm, notifier, options, log, |_| Ok(()));
                         Ok(())
                     });
 
