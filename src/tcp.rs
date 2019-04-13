@@ -25,9 +25,9 @@ use codec::IntoTransport;
 use error::Error;
 use handshake::Handshake;
 use net2::TcpBuilder;
-use raft::RaftStart;
+use raft::{ConnectionSolver, RaftStart};
 
-/// A shared connection pool to ensure client and server-side connections to be mutually exclusive
+/// A shared connection pool to ensure client- and server-side connections to be mutually exclusive
 #[derive(Debug, Clone)]
 pub struct Connections(pub(crate) Arc<Mutex<HashMap<ServerId, bool>>>);
 
@@ -65,12 +65,12 @@ where
 /// S is the connection itself as tokio sees it
 /// C is a hook for setting up the initial connection options before starting connecting, it's future F should create
 /// the connection
-pub struct TcpWatch<T, H, S, C, F>
+pub struct TcpWatch<T, H, S, V, C, F>
 where
     T: IntoTransport<S, PeerMessage> + Send + 'static,
     S: AsyncRead + AsyncWrite + Send + 'static,
+    V: ConnectionSolver + Send + 'static,
     C: ConnectionMaker<S, F>,
-
     F: IntoFuture<Item = S, Error = Error, Future = Box<Future<Item = S, Error = Error> + Send>>
         + Send
         + 'static,
@@ -85,12 +85,14 @@ where
     factory: C,
     logger: Logger,
     _pd: PhantomData<F>,
+    solver: V,
 }
 
-impl<T, H, S, C, F> TcpWatch<T, H, S, C, F>
+impl<T, H, S, V, C, F> TcpWatch<T, H, S, V, C, F>
 where
     T: IntoTransport<S, PeerMessage> + Send + 'static,
     S: AsyncRead + AsyncWrite + Send + 'static,
+    V: ConnectionSolver + Send + 'static,
     C: ConnectionMaker<S, F>,
     F: IntoFuture<Item = S, Error = Error, Future = Box<Future<Item = S, Error = Error> + Send>>
         + Send
@@ -106,6 +108,7 @@ where
         handshake: H,
         factory: C,
         logger: Logger,
+        solver: V,
     ) -> Self {
         Self {
             id,
@@ -118,15 +121,17 @@ where
             factory,
             logger,
             _pd: PhantomData,
+            solver,
         }
     }
 }
 
-impl<T, H, S, C, F> IntoFuture for TcpWatch<T, H, S, C, F>
+impl<T, H, S, V, C, F> IntoFuture for TcpWatch<T, H, S, V, C, F>
 where
     T: IntoTransport<S, PeerMessage> + Clone + Send + 'static,
     H: Handshake<S, Item = ServerId> + Clone + Send + 'static,
     S: AsyncRead + AsyncWrite + Send + 'static,
+    V: ConnectionSolver + Clone + Send + 'static,
     C: ConnectionMaker<S, F> + Send + 'static,
     F: IntoFuture<Item = S, Error = Error, Future = Box<Future<Item = S, Error = Error> + Send>>
         + Send
@@ -146,6 +151,7 @@ where
             handshake,
             factory,
             transport,
+            solver,
             logger,
             ..
         } = self;
@@ -184,9 +190,10 @@ where
                 let mut client_handshake = handshake.clone();
                 client_handshake.set_is_client(true);
                 let transport = transport.clone();
+                    let rsolver = solver.clone();
                 let client_future = factory.make_connection(*addr).into_future().and_then(move |stream| {
                     let mut start =
-                        RaftStart::new(id, conns, new_conns, stream, transport, client_handshake);
+                        RaftStart::new(id, conns, new_conns, stream, transport, client_handshake, rsolver);
                     start.set_is_client(true);
                     start
                 });
@@ -194,7 +201,7 @@ where
                 let internal_tx = internal_tx.clone();
                 let logger = logger.clone();
 
-                let delay = if is_client && id > dc_id {
+                let delay = if solver.solve(is_client, id, dc_id)  {
                     // we have priority on connect - reconnect immediately
                     Duration::from_millis(0)
                 } else {
@@ -349,11 +356,12 @@ where
 
 /// TcpServer works all the time raft exists, is responsible for keeping all connections
 /// to all nodes alive and in a single unique instance
-pub struct TcpServer<T, H, S, L>
+pub struct TcpServer<T, H, S, L, V>
 where
     T: IntoTransport<S, PeerMessage> + Send + 'static,
     S: AsyncRead + AsyncWrite + Send + 'static,
     L: Stream<Item = S, Error = IoError> + Send + 'static,
+    V: ConnectionSolver + Send + 'static,
 {
     id: ServerId,
     listener: L,
@@ -361,13 +369,15 @@ where
     tx: UnboundedSender<(ServerId, T::Transport)>,
     transport: T,
     handshake: H,
+    solver: V,
 }
 
-impl<T, H, S, L> TcpServer<T, H, S, L>
+impl<T, H, S, L, V> TcpServer<T, H, S, L, V>
 where
     T: IntoTransport<S, PeerMessage> + Send + 'static,
     S: AsyncRead + AsyncWrite + Send + 'static,
     L: Stream<Item = S, Error = IoError> + Send + 'static,
+    V: ConnectionSolver + Send + 'static,
 {
     pub fn new(
         id: ServerId,
@@ -376,6 +386,7 @@ where
         tx: UnboundedSender<(ServerId, T::Transport)>,
         transport: T,
         handshake: H,
+        solver: V,
     ) -> Self {
         Self {
             id,
@@ -384,16 +395,18 @@ where
             tx,
             transport,
             handshake,
+            solver,
         }
     }
 }
 
-impl<T, H, S, L> IntoFuture for TcpServer<T, H, S, L>
+impl<T, H, S, L, V> IntoFuture for TcpServer<T, H, S, L, V>
 where
     T: IntoTransport<S, PeerMessage> + Clone + Send + 'static,
     H: Handshake<S, Item = ServerId> + Clone + Send + 'static,
     S: AsyncRead + AsyncWrite + Send + 'static,
     L: Stream<Item = S, Error = IoError> + Send + 'static,
+    V: ConnectionSolver + Clone + Send + 'static,
 {
     type Item = ();
     type Error = Error;
@@ -407,6 +420,7 @@ where
             tx,
             transport,
             handshake,
+            solver,
         } = self;
 
         let fut = listener
@@ -420,6 +434,7 @@ where
                     stream,
                     transport.clone(),
                     handshake.clone(),
+                    solver.clone(),
                 );
                 start.set_is_client(false);
                 start

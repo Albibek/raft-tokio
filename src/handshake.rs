@@ -2,6 +2,12 @@
 use tokio::prelude::future::*;
 use tokio::prelude::*;
 
+use capnp::message::Reader as CapnpReader;
+use capnp::message::DEFAULT_READER_OPTIONS;
+use capnp_futures::serialize::OwnedSegments;
+use capnp_futures::serialize::{read_message, write_message};
+use handshake_capnp::handshake as capnp_handshake;
+
 use raft_consensus::ServerId;
 
 use error::Error;
@@ -28,6 +34,12 @@ where
     /// An optional convenience method allowing to implement both side handshake in one type
     /// Intended to help determining if handshake is working on client or server currently
     fn set_is_client(&mut self, bool) {}
+
+    /// Before resolving the future, a connection can be checked for being a duplicate of another
+    /// connection so
+    fn is_correct(&self) -> bool {
+        false
+    }
 }
 
 /// This traits adds with_handshake method to `Stream` allowing to prepend it
@@ -55,6 +67,13 @@ where
     }
 }
 
+/// A message for HelloHandshake protocol
+#[derive(Debug, Serialize, Deserialize)]
+pub enum HelloHandshakeMessage {
+    Hello(ServerId),
+    Ehlo(ServerId),
+}
+
 //TODO add list of allowed serverid-s
 /// A simple hello-ehlo handshake. Only ServerId of each side is sent in both directions.
 #[derive(Clone, Debug)]
@@ -71,32 +90,6 @@ impl HelloHandshake {
             self_id,
             is_client: true,
         }
-    }
-}
-
-use capnp::message::Reader as CapnpReader;
-use capnp::message::DEFAULT_READER_OPTIONS;
-use capnp_futures::serialize::OwnedSegments;
-use capnp_futures::serialize::{read_message, write_message};
-use handshake_capnp::handshake as capnp_handshake;
-
-fn ehlo_from_reader(reader: CapnpReader<OwnedSegments>) -> Result<ServerId, Error> {
-    let message = reader
-        .get_root::<capnp_handshake::Reader>()
-        .map_err(Error::Capnp)?;
-    match message.which().map_err(Error::CapnpSchema)? {
-        capnp_handshake::Which::Hello(_) => Err(Error::ClientHandshake),
-        capnp_handshake::Which::Ehlo(id) => Ok(id.into()),
-    }
-}
-
-fn helo_from_reader(reader: CapnpReader<OwnedSegments>) -> Result<ServerId, Error> {
-    let message = reader
-        .get_root::<capnp_handshake::Reader>()
-        .map_err(Error::Capnp)?;
-    match message.which().map_err(Error::CapnpSchema)? {
-        capnp_handshake::Which::Ehlo(_) => Err(Error::ServerHandshake),
-        capnp_handshake::Which::Hello(id) => Ok(id.into()),
     }
 }
 
@@ -118,40 +111,35 @@ where
             let future = write_message(stream, builder)
                 .and_then(move |(stream, _)| read_message(stream, DEFAULT_READER_OPTIONS))
                 .map_err(Error::Capnp)
-                .and_then(move |(stream, response)| {
-                    match response {
-                        Some(reader) => match ehlo_from_reader(reader) {
-                            Ok(id) => Either::A(ok((id.into(), stream))),
-                            Err(e) => Either::B(failed(e)),
-                        },
-                        None => Either::B(failed(Error::ClientHandshake)),
-                    }
+                .and_then(move |(stream, response)| match response {
+                    Some(reader) => match ehlo_from_reader(reader) {
+                        Ok(id) => Either::A(ok((id.into(), stream))),
+                        Err(e) => Either::B(failed(e)),
+                    },
+                    None => Either::B(failed(Error::ClientHandshake)),
                 });
 
             Box::new(future)
         } else {
-         let future = read_message(stream, DEFAULT_READER_OPTIONS)
-             .map_err(Error::Capnp)
-             .and_then( move |(stream, request)| {
-                     match request {
-                        Some(reader) => match helo_from_reader(reader) {
-                            Ok(id) => Either::A(ok((id.into(), stream))),
-                            Err(e) => Either::B(failed(e)),
-                        },
-                        None => Either::B(failed(Error::ServerHandshake)),
+            let future = read_message(stream, DEFAULT_READER_OPTIONS)
+                .map_err(Error::Capnp)
+                .and_then(move |(stream, request)| match request {
+                    Some(reader) => match helo_from_reader(reader) {
+                        Ok(id) => Either::A(ok((id.into(), stream))),
+                        Err(e) => Either::B(failed(e)),
+                    },
+                    None => Either::B(failed(Error::ServerHandshake)),
+                }).and_then(move |(id, stream)| {
+                    let mut builder = ::capnp::message::Builder::new_default();
+                    {
+                        let mut message = builder.init_root::<capnp_handshake::Builder>();
+                        message.set_ehlo(self_id.into());
                     }
-        }).and_then(move |(id, stream)| {
-             let mut builder = ::capnp::message::Builder::new_default();
-            {
-                let mut message = builder.init_root::<capnp_handshake::Builder>();
-                message.set_ehlo(self_id.into());
-            }
-                 write_message(stream, builder).map(move |(stream, _)| {
-                     (id, stream)
-                 }).map_err(Error::Capnp)
-
-             });
-         Box::new(future)
+                    write_message(stream, builder)
+                        .map(move |(stream, _)| (id, stream))
+                        .map_err(Error::Capnp)
+                });
+            Box::new(future)
         }
     }
 
@@ -160,11 +148,24 @@ where
     }
 }
 
-/// A message for HelloHandshake protocol
-#[derive(Debug, Serialize, Deserialize)]
-pub enum HelloHandshakeMessage {
-    Hello(ServerId),
-    Ehlo(ServerId),
+fn ehlo_from_reader(reader: CapnpReader<OwnedSegments>) -> Result<ServerId, Error> {
+    let message = reader
+        .get_root::<capnp_handshake::Reader>()
+        .map_err(Error::Capnp)?;
+    match message.which().map_err(Error::CapnpSchema)? {
+        capnp_handshake::Which::Hello(_) => Err(Error::ClientHandshake),
+        capnp_handshake::Which::Ehlo(id) => Ok(id.into()),
+    }
+}
+
+fn helo_from_reader(reader: CapnpReader<OwnedSegments>) -> Result<ServerId, Error> {
+    let message = reader
+        .get_root::<capnp_handshake::Reader>()
+        .map_err(Error::Capnp)?;
+    match message.which().map_err(Error::CapnpSchema)? {
+        capnp_handshake::Which::Ehlo(_) => Err(Error::ServerHandshake),
+        capnp_handshake::Which::Hello(id) => Ok(id.into()),
+    }
 }
 
 /*
