@@ -1,0 +1,12 @@
+# This is an example of rafter config
+[node.1]
+listen = "10.9.7.253:9991"
+id = 1
+
+[node.2]
+listen = "10.9.1.121:9991"
+id = 2
+
+[node.3]
+listen = "10.9.1.122:9991"
+id = 3

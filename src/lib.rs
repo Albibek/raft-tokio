@@ -160,7 +160,7 @@ use tcp::{Connections, TcpServer, TcpWatch};
 /// Note that `peers` must contain a list of all peers including current node.
 /// Requires default tokio runtime to be already running, and may panic otherwise.
 /// also panics on other errors
-pub fn start_raft_tcp<RL, RM, L, N, C, F>(
+pub fn start_raft_tcp<RL, RM, L, N, V, F>(
     id: ServerId,
     mut nodes: HashMap<ServerId, SocketAddr>,
     raft_log: RL,
@@ -168,14 +168,14 @@ pub fn start_raft_tcp<RL, RM, L, N, C, F>(
     notifier: N,
     options: RaftOptions,
     logger: L,
-    solver: C,
+    solver: V,
     conn_hook: F,
 ) where
     RL: Log + Send + 'static,
     RM: StateMachine,
     L: Into<Option<Logger>>,
     N: Notifier + Send + 'static,
-    C: ConnectionSolver + Clone + Send + 'static,
+    V: ConnectionSolver + Clone + Send + 'static,
     for<'r> F: FnMut(&'r mut StdTcpStream) -> Result<(), std::io::Error> + Clone + Send + 'static,
 {
     let logger = logger
@@ -314,8 +314,8 @@ mod tests {
 
                     // Create the runtime
                     let mut runtime = Runtime::new().expect("creating runtime");
-                    let notifier = ::raft::DoNotNotify;
 
+                    let notifier = ::raft::DoNotNotify;
                     let solver = BiggerIdSolver;
 
                     let raft = lazy(|| {

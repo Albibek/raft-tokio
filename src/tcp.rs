@@ -190,7 +190,7 @@ where
                 let mut client_handshake = handshake.clone();
                 client_handshake.set_is_client(true);
                 let transport = transport.clone();
-                    let rsolver = solver.clone();
+                let rsolver = solver.clone();
                 let client_future = factory.make_connection(*addr).into_future().and_then(move |stream| {
                     let mut start =
                         RaftStart::new(id, conns, new_conns, stream, transport, client_handshake, rsolver);
